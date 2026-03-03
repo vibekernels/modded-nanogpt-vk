@@ -157,13 +157,16 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # -----------------------------------------------------------------------------
 # Polar Express
 
-# Computed for num_iters=5, safety_factor=2e-2, cushion=2
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+# Turbo-Muon AOL preconditioning + 4-iteration Newton-Schulz coefficients
+# From flash-newton-schulz by thib-s (Boissin et al., 2025)
+# AOL diagonal preconditioning tightens the initial singular value distribution,
+# enabling convergence in 4 iterations instead of 5.
+# https://arxiv.org/abs/2512.04632
+turbo_muon_aol_coeffs = [
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
@@ -187,8 +190,7 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
     X = g.bfloat16()
     is_tall = g.size(-2) > g.size(-1)
 
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    # AOL preconditioning replaces spectral normalization (applied at i==0 below)
 
     X = X.contiguous()
 
@@ -205,8 +207,14 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
             aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
 
         # Perform the iterations
-        for a, b, c in polar_express_coeffs:
+        for i, (a, b, c) in enumerate(turbo_muon_aol_coeffs):
             XTX(X, out=A)  # A = X.T @ X
+            if i == 0:
+                # AOL diagonal preconditioning (Turbo-Muon, Boissin et al. 2025)
+                # Rescale X by diagonal matrix derived from Gram matrix row norms
+                s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), min=1e-7))
+                X = X * s.unsqueeze(-2)  # scale columns of X
+                A = A * s.unsqueeze(-1) * s.unsqueeze(-2)  # scale both dims of A
             ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
 
             # Referencing X twice causes pytorch to make a defensive copy,
@@ -233,8 +241,13 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
             aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
         # Perform the iterations
-        for a, b, c in polar_express_coeffs:
+        for i, (a, b, c) in enumerate(turbo_muon_aol_coeffs):
             XXT(X, out=A)  # A = X @ X.mT
+            if i == 0:
+                # AOL diagonal preconditioning (Turbo-Muon, Boissin et al. 2025)
+                s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), min=1e-7))
+                X = X * s.unsqueeze(-1)  # scale rows of X
+                A = A * s.unsqueeze(-1) * s.unsqueeze(-2)  # scale both dims of A
             ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
 
             if split_baddbmm:
