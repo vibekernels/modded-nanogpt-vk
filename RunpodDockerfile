@@ -1,31 +1,53 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM --platform=linux/amd64 nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV SHELL=/bin/bash
+ENV PYTHONUNBUFFERED=1
 
-# Create ubuntu user with sudo access
-RUN useradd -m -s /bin/bash ubuntu && \
-    apt-get update && \
-    apt-get install -y sudo && \
-    echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install essentials + SSH + Python 3.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server sudo git curl wget vim tmux build-essential \
+    software-properties-common ca-certificates \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/local/bin/pip3.11 /usr/local/bin/pip
+
+# SSH setup
+RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
+    && rm -f /etc/ssh/ssh_host_* \
+    && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+
+# Create ubuntu user with sudo
+RUN useradd -m -s /bin/bash ubuntu \
+    && echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Install PyTorch 2.10 + repo dependencies
+RUN pip install --no-cache-dir torch==2.10 \
+    && pip install --no-cache-dir numpy tqdm huggingface-hub kernels setuptools "typing-extensions==4.15.0" \
+    && pip install --no-cache-dir datasets tiktoken
 
 # Clone the repo
-RUN git clone https://github.com/vibekernels/modded-nanogpt-vk.git /home/ubuntu/modded-nanogpt-vk && \
-    chown -R ubuntu:ubuntu /home/ubuntu/modded-nanogpt-vk
+RUN git clone https://github.com/vibekernels/modded-nanogpt-vk.git /home/ubuntu/modded-nanogpt-vk \
+    && chown -R ubuntu:ubuntu /home/ubuntu
 
 WORKDIR /home/ubuntu/modded-nanogpt-vk
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir datasets tiktoken
+# Startup script: configure SSH keys and start sshd, then sleep forever
+RUN printf '#!/bin/bash\n\
+ssh-keygen -A\n\
+if [ -n "$PUBLIC_KEY" ]; then\n\
+  mkdir -p /root/.ssh /home/ubuntu/.ssh\n\
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys\n\
+  echo "$PUBLIC_KEY" >> /home/ubuntu/.ssh/authorized_keys\n\
+  chmod 600 /root/.ssh/authorized_keys /home/ubuntu/.ssh/authorized_keys\n\
+  chown -R ubuntu:ubuntu /home/ubuntu/.ssh\n\
+fi\n\
+/usr/sbin/sshd\n\
+sleep infinity\n' > /start.sh && chmod +x /start.sh
 
-# Download pre-tokenized FineWeb data (9 chunks = 900M tokens)
-RUN python data/cached_fineweb10B.py 9
-
-# Ensure ubuntu owns everything
-RUN chown -R ubuntu:ubuntu /home/ubuntu
-
-USER ubuntu
-WORKDIR /home/ubuntu/modded-nanogpt-vk
-
-CMD ["/bin/bash"]
+CMD ["/start.sh"]
