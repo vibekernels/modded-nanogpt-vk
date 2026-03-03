@@ -1,33 +1,43 @@
-FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu24.04
+FROM --platform=linux/amd64 nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHON_VERSION=3.12.7
-ENV PATH=/usr/local/bin:$PATH
+ENV SHELL=/bin/bash
+ENV PYTHONUNBUFFERED=1
 
-RUN apt update && apt install -y --no-install-recommends build-essential libssl-dev zlib1g-dev \
-    libbz2-dev libreadline-dev libsqlite3-dev curl git libncursesw5-dev xz-utils tk-dev libxml2-dev \
-    libxmlsec1-dev libffi-dev liblzma-dev \
-    && apt clean && rm -rf /var/lib/apt/lists/*
+# Install essentials + SSH + Python 3.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server sudo git curl wget vim tmux build-essential \
+    software-properties-common ca-certificates \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3.11-distutils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/local/bin/pip3.11 /usr/local/bin/pip
 
-RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
-    tar -xzf Python-${PYTHON_VERSION}.tgz && \
-    cd Python-${PYTHON_VERSION} && \
-    ./configure --enable-optimizations && \
-    make -j$(nproc) && \
-    make altinstall && \
-    cd .. && \
-    rm -rf Python-${PYTHON_VERSION} Python-${PYTHON_VERSION}.tgz
+# SSH setup
+RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
+    && rm -f /etc/ssh/ssh_host_* \
+    && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
-RUN ln -s /usr/local/bin/python3.12 /usr/local/bin/python && \
-    ln -s /usr/local/bin/pip3.12 /usr/local/bin/pip
+# Copy repo and install dependencies from requirements.txt
+COPY . /root/modded-nanogpt-vk
+RUN pip install --no-cache-dir -r /root/modded-nanogpt-vk/requirements.txt
 
-COPY requirements.txt /modded-nanogpt/requirements.txt
-WORKDIR /modded-nanogpt
+WORKDIR /root/modded-nanogpt-vk
 
-RUN python -m pip install --upgrade pip && \
-    pip install -r requirements.txt
+# Startup script: configure SSH keys and start sshd, then sleep forever
+RUN printf '#!/bin/bash\n\
+ssh-keygen -A\n\
+if [ -n "$PUBLIC_KEY" ]; then\n\
+  mkdir -p /root/.ssh\n\
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys\n\
+  chmod 600 /root/.ssh/authorized_keys\n\
+fi\n\
+/usr/sbin/sshd\n\
+sleep infinity\n' > /start.sh && chmod +x /start.sh
 
-RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
-
-CMD ["bash"]
-ENTRYPOINT []
+CMD ["/start.sh"]
+# Built via GitHub Actions -> ghcr.io/vibekernels/modded-nanogpt-vk
