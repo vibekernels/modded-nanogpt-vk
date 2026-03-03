@@ -3,12 +3,15 @@ name: Build and Push Docker Image
 on:
   workflow_dispatch:
   push:
-    branches:
-      - pwalker/2026-03-02_optimized
+    paths:
+      - RunpodDockerfile
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,12 +26,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ "${{ github.ref_name }}" = "master" ]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            SAFE_BRANCH=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            echo "tag=${SAFE_BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: RunpodDockerfile
           push: true
-          tags: ghcr.io/vibekernels/modded-nanogpt-vk:latest
+          tags: ghcr.io/vibekernels/modded-nanogpt-vk:${{ steps.tag.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
