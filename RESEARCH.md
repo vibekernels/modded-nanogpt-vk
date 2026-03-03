@@ -55,10 +55,20 @@ time from 38.4 min to 11.2 min on 1xH100 (see [Systems Optimization](#systems-op
 | CWD mask fix | **4.2121** | **3.8077** | **3.5209** | **3.3722** |
 | Combined | 4.2126 | 3.8094 | 3.5188 | 3.3727 |
 
+### Round 3: GPU Data Prep + CWD + Sinks (current code)
+
+Both CWD mask fix and GPT-OSS attention sinks are now implemented in `train_gpt.py`.
+
+| Optimization | Final val_loss | Delta vs GPU baseline | Verdict |
+|---|---|---|---|
+| GPU data prep baseline | 3.2813 | — | — |
+| **CWD + sinks (current code)** | **3.2790** | **-0.0023** | **Implemented** |
+
 ### Key Findings
 
 - **CWD mask fix is the strongest single optimization** across both rounds
 - GPT-OSS sinks improve steadily in later training (strongest at step 1000+)
+- CWD + sinks combined: -0.0023 (between individual results, confirming non-additivity)
 - Cooldown frac 0.55 (shorter cooldown) matches best results but worse intermediates
 - **Optimizations are NOT additive** — combining any two produces worse results than either alone
 - This non-additivity pattern held across both CPU and GPU data prep rounds; the optimizations
@@ -70,10 +80,14 @@ time from 38.4 min to 11.2 min on 1xH100 (see [Systems Optimization](#systems-op
 - Soft-cap normalization for embeddings causes training instability
 - Gradient clipping at stage transitions (max_norm=1.0, ±2 steps) too aggressive
 
-### Recommendation
+### Current State
 
-For submission: **CWD mask fix** is the strongest, most robust, and simplest change
-(one character: `>=` to `>`). It was best or tied-for-best in both CPU and GPU baseline rounds.
+**Implemented in `train_gpt.py`:**
+1. **GPU data prep** — 3.4x training speedup (38.4 min → 11.2 min on 1xH100)
+2. **CWD mask fix** (`>=` → `>`) — strongest single model quality improvement
+3. **GPT-OSS attention sinks** — learned LSE-based gating on attention output
+
+Combined val_loss: **3.2790** (vs 3.2813 GPU baseline, **-0.0023**).
 
 ---
 
@@ -173,19 +187,15 @@ Polar Express orthogonalization (5 iterations of 768x768 matmuls). Needs converg
 
 **Source:** [PR #172](https://github.com/KellerJordan/modded-nanogpt/pull/172)
 **Suggested by:** ClassicLarry
-**Status:** **Best optimization. val_loss -0.0009 (CPU baseline), -0.0035 (GPU baseline).**
+**Status:** **Implemented. val_loss -0.0009 (CPU baseline), -0.0035 (GPU baseline).**
 
 The Adam CWD path uses `>` (correct — zero gradients do not trigger weight decay).
-The NorMuon CWD path at `_cautious_wd_and_update_inplace` uses `>=`, which means
-tokens with zero gradients (unseen in the current batch) still get weight decay
-applied. For sparse embeddings processed by NorMuon, this drives rarely-seen
-token embeddings toward zero.
+The NorMuon CWD path at `_cautious_wd_and_update_inplace` previously used `>=`, which
+meant tokens with zero gradients (unseen in the current batch) still got weight decay
+applied. For sparse embeddings processed by NorMuon, this drove rarely-seen
+token embeddings toward zero. Fixed to `>`.
 
 ```python
-# Current (NorMuon path):
-mask = (grad * p_precise) >= 0
-
-# Fix:
 mask = (grad * p_precise) > 0
 ```
 
@@ -193,7 +203,7 @@ mask = (grad * p_precise) > 0
 
 **Source:** [PR #117](https://github.com/KellerJordan/modded-nanogpt/pull/117) discussion
 **Suggested by:** ClassicLarry (collaborator)
-**Status:** **Positive. val_loss -0.0014 (CPU baseline), -0.0017 (GPU baseline).**
+**Status:** **Implemented. val_loss -0.0014 (CPU baseline), -0.0017 (GPU baseline).**
 
 The model already has a **sparse attention gate** — a per-head sigmoid deciding
 "should this query attend at all?" GPT-OSS sinks address the complementary
