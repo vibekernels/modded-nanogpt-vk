@@ -1558,22 +1558,37 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _cum_lengths[0] = 0
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
 
-        # Transfer raw uint16 buffer to GPU, then do type conversions + bigram hash on GPU.
-        # This eliminates the CPU bottleneck in Stages 2-3 (~450ms/accum -> ~0.7ms/accum).
-        buf_gpu = buf.to(device="cuda", non_blocking=True)
-        _inputs = buf_gpu[:-1].to(dtype=torch.int32)
-        _targets = buf_gpu[1:].to(dtype=torch.int64)
-        _cum_lengths = _cum_lengths.to(device="cuda", dtype=torch.int32)
-        _bigram_inputs = get_bigram_hash(_inputs)
-        _bigram_cpu = _bigram_inputs.cpu().numpy() if _sparse_comms_active() else np.empty(0, dtype=np.int32)
+        if _sparse_comms_active():
+            # 8xGPU with sparse comms: do data prep on CPU (GPU path causes contention)
+            _inputs = buf[:-1].to(dtype=torch.int32)
+            _targets = buf[1:].to(dtype=torch.int64)
+            _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+            _bigram_inputs = get_bigram_hash(_inputs)
+            _bigram_cpu = _bigram_inputs.numpy()
 
-        new_params = yield (
-            _inputs,
-            _targets,
-            _cum_lengths,
-            _bigram_inputs,
-            _bigram_cpu,
-        )
+            new_params = yield (
+                _inputs.to(device="cuda", non_blocking=True),
+                _targets.to(device="cuda", non_blocking=True),
+                _cum_lengths.to(device="cuda", non_blocking=True),
+                _bigram_inputs.to(device="cuda", non_blocking=True),
+                _bigram_cpu,
+            )
+        else:
+            # No sparse comms: transfer raw uint16 buffer to GPU, then do type conversions + bigram hash on GPU.
+            # This eliminates the CPU bottleneck in data prep (~450ms/accum -> ~0.7ms/accum).
+            buf_gpu = buf.to(device="cuda", non_blocking=True)
+            _inputs = buf_gpu[:-1].to(dtype=torch.int32)
+            _targets = buf_gpu[1:].to(dtype=torch.int64)
+            _cum_lengths = _cum_lengths.to(device="cuda", dtype=torch.int32)
+            _bigram_inputs = get_bigram_hash(_inputs)
+
+            new_params = yield (
+                _inputs,
+                _targets,
+                _cum_lengths,
+                _bigram_inputs,
+                np.empty(0, dtype=np.int32),
+            )
 
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
