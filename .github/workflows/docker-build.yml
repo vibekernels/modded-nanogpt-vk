@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - pwalker/2026-03-02_optimized
-    paths:
-      - RunpodDockerfile
 
 jobs:
   build-and-push:
