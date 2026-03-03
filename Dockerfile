@@ -24,6 +24,11 @@ RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
 
 # Copy repo and install dependencies from requirements.txt
 COPY . /root/modded-nanogpt-vk
+# actions/checkout injects GITHUB_TOKEN into .git/config as an http extraheader.
+# Strip it so the credential doesn't leak into the published image.
+RUN git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null; \
+    cd /root/modded-nanogpt-vk && git config --unset-all http.https://github.com/.extraheader 2>/dev/null; \
+    true
 RUN pip install --no-cache-dir -r /root/modded-nanogpt-vk/requirements.txt
 
 WORKDIR /root/modded-nanogpt-vk
