@@ -89,6 +89,22 @@ Both CWD mask fix and GPT-OSS attention sinks are now implemented in `train_gpt.
 
 Combined val_loss: **3.2790** (vs 3.2813 GPU baseline, **-0.0023**).
 
+### Estimated 8xH100 Impact
+
+**GPU data prep:** Impact is hardware-dependent and hard to predict without profiling on
+actual 8xH100 leaderboard hardware. On 8xH100, `grad_accum_steps=1`, so each GPU prepares
+49,152 tokens once per training step (same per-accum workload as 1xH100). The 488ms/step
+CPU data prep bottleneck was measured on our RunPod machine. If the leaderboard CPUs had
+the same bottleneck, Stage 2 data prep alone (250 steps × 488ms = 122s) would exceed the
+entire 88-second record — so either leaderboard CPUs are much faster or data prep isn't the
+bottleneck there. Profiling on 8xH100 needed to quantify.
+
+**CWD mask fix + GPT-OSS sinks:** These are model quality improvements (-0.0023 val_loss),
+not per-step speedups. The training schedule is fixed at 1490 steps, so time savings come
+from reaching 3.28 val_loss in fewer steps. From the loss curve's final-phase improvement
+rate (~0.000387/step), the -0.0023 margin allows ~6 fewer steps. At ~60ms/step on 8xH100,
+this saves **~0.4 seconds** — negligible relative to the 88-second record.
+
 ---
 
 ## Systems Optimization: GPU Data Prep
