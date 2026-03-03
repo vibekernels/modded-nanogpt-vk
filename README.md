@@ -17,3 +17,9 @@ cd /root/modded-nanogpt-vk
 python data/cached_fineweb10B.py 9
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
+
+## Performance History
+
+| Commit | Description | Val Loss | Train Time |
+|--------|-------------|----------|------------|
+| [`dd11b65`](https://github.com/vibekernels/modded-nanogpt-vk/commit/dd11b6533423c707659feb14633bbfc3d505d4ff) | Initial fork | 3.2808 | 2294s |
