@@ -1488,17 +1488,13 @@ def get_bigram_hash(x):
     Multiply by arbitary large ints to get even spread over int32 range.
     Position 0 is mapped to the reserved index (vocab_size - 1).
     BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-    Works on both CPU and GPU tensors.
+    Works on both CPU and CUDA tensors.
     """
     rand_int_1 = 36313
     rand_int_2 = 27191
     mod = args.bigram_vocab_size-1
     x = x.to(torch.int32)
-    if x.is_cuda:
-        out = x.clone()
-    else:
-        out = torch.empty_like(x, pin_memory=True)
-        out.copy_(x)
+    out = x.clone()
     out[0] = mod
     out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
@@ -1541,6 +1537,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
                 continue
 
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+            _inputs = buf[:-1]
+            _targets = buf[1:]
             end_idxs[-1] -= 1  # last document was too long to account for _targets offset
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
 
@@ -1550,7 +1548,10 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 
             pos_local = pos + rank * num_tokens_local
             buf = tokens[pos_local: pos_local + num_tokens_local + 1]
-            cum_lengths = torch.nonzero(buf[:-1] == BOS_ID)[:, 0]
+            _inputs = buf[:-1].view(num_tokens_local, )
+            _targets = buf[1:].view(num_tokens_local, )
+
+            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
             pos += num_tokens
 
 
@@ -1558,14 +1559,16 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         _cum_lengths[0] = 0
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
 
-        # Transfer raw uint16 buffer to GPU, then do type conversions + bigram hash on GPU.
-        # This eliminates the CPU bottleneck in Stages 2-3 (~450ms/accum -> ~0.7ms/accum).
-        buf_gpu = buf.to(device="cuda", non_blocking=True)
-        _inputs = buf_gpu[:-1].to(dtype=torch.int32)
-        _targets = buf_gpu[1:].to(dtype=torch.int64)
-        _cum_lengths = _cum_lengths.to(device="cuda", dtype=torch.int32)
+        # Transfer raw uint16 buf to GPU, then do type conversions + bigram hash on GPU
+        _cum_lengths = _cum_lengths.to(dtype=torch.int32, device="cuda", non_blocking=True)
+        _inputs = _inputs.to(device="cuda", non_blocking=True)
+        _targets = _targets.to(device="cuda", non_blocking=True)
+        _inputs = _inputs.to(dtype=torch.int32)
+        _targets = _targets.to(dtype=torch.int64)
         _bigram_inputs = get_bigram_hash(_inputs)
-        _bigram_cpu = _bigram_inputs.cpu().numpy() if _sparse_comms_active() else np.empty(0, dtype=np.int32)
+
+        # Only compute CPU numpy copy when sparse comms are active (8-GPU, grad_accum=1)
+        _bigram_cpu = _bigram_inputs.cpu().numpy() if _sparse_comms_active() else None
 
         new_params = yield (
             _inputs,

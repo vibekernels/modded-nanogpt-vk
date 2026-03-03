@@ -88,6 +88,14 @@ Peak memory:       unchanged (37,326 MiB)
 Correctness:       verified identical outputs (CPU vs GPU bigram hash)
 ```
 
+**Re-validated with Triton 3.6.0** (originally developed under Triton 3.4.0 which had NaN issues):
+
+```
+Stage 2 step time: 3,884ms -> 652ms  (6.0x speedup)
+Total train time:  38.4min -> 11.2min (3.4x speedup, 70.8% reduction)
+val_loss:          3.2801 -> 3.2813  (+0.0012, within run-to-run variance)
+```
+
 The initial estimate of "3-4x on Stage 2, 30-40% total reduction" was conservative.
 The actual speedup far exceeded predictions because:
 1. GPU data prep is faster than estimated (0.08ms vs 0.7ms projected)
@@ -125,11 +133,59 @@ Additionally, prefetching across training steps is complex because `Shard.next_b
 
 **Risk to loss**: Needs careful validation -- optimizer precision affects convergence.
 
+## Model Quality Experiments (on GPU Data Prep Baseline)
+
+With GPU data prep reducing per-run time to ~11 min, extensive model quality experiments
+were run. Full results in PR_RESEARCH.md. Summary of best results:
+
+### Best Individual Optimizations (vs GPU baseline val_loss 3.2813)
+
+| Optimization | val_loss | Delta | Code Change |
+|---|---|---|---|
+| **CWD mask fix (>= → >)** | **3.2778** | **-0.0035** | One-character change in `_cautious_wd_and_update_inplace` |
+| **CWD + GPT-OSS sinks** | **3.2780** | **-0.0033** | CWD fix + ~3-line attention sink gate |
+| **Cooldown frac 0.55** | **3.2780** | **-0.0033** | One-number change in TrainingSchedule |
+| GPT-OSS sinks | 3.2796 | -0.0017 | Per-head learned threshold for attention output gating |
+| Bigram lr_mul 50 | 3.2796 | -0.0017 | Reduce bigram_embed lr_mul from 75 to 50 |
+
+### Optimizations That Hurt
+
+| Optimization | Result | Notes |
+|---|---|---|
+| Cooldown frac 0.65 | 3.2809 | Marginal, not worth complexity |
+| Value_embeds wd_mul 2.0 | 3.2815 | Good intermediates but converged to baseline |
+| Resid_lambdas lr_mul 10 | 3.2833 | Default 5.0 is better |
+| Soft-cap norm (embeddings) | Killed | Training instability at step 750 |
+| Grad clipping at transitions | Killed | Too aggressive, interfered with training |
+
+### Key Insight: Non-Additivity
+
+Combining multiple good optimizations consistently produces worse results than
+any individual optimization alone:
+
+| Combination | val_loss | vs best individual |
+|---|---|---|
+| CWD + sinks | 3.2780 | Same as CWD alone (3.2778) |
+| CWD + sinks + cooldown 0.55 | 3.2808 | Worse than any individual |
+| CWD + cooldown 0.55 | 3.2816 | Worse than any individual |
+
+This pattern held across both CPU and GPU data prep rounds. The optimizations
+likely find similar loss landscape minima from different directions rather than
+addressing independent inefficiencies.
+
+### Recommendation
+
+For submission: **CWD mask fix** is the strongest, most robust, and simplest change
+(one character). It was best or tied-for-best in both CPU baseline and GPU baseline rounds.
+
 ## Priority Summary (Updated)
 
 | # | Optimization | Predicted | Actual | Status |
 |---|-------------|-----------|--------|--------|
 | 1 | GPU data prep | ~3-4x Stage 2 (~30-40% total) | **6.5x Stage 2 (73.4% total)** | Implemented |
-| 2 | Data prefetch | ~10-20% on Stage 2 | <1% (after Opt #1) | Skipped |
-| 3 | Reduce fwd variance | ~5-10% on Stage 2 | N/A | Already in codebase |
-| 4 | Optimizer FP8 | ~5% overall | N/A | Needs validation |
+| 2 | CWD mask fix (>= → >) | ~0.3–0.9s | **val_loss -0.0035** | Validated |
+| 3 | GPT-OSS attention sinks | ~0.6–1.8s | **val_loss -0.0017** | Validated |
+| 4 | Cooldown frac 0.55 | N/A | **val_loss -0.0033** | Validated |
+| 5 | Data prefetch | ~10-20% on Stage 2 | <1% (after Opt #1) | Skipped |
+| 6 | Reduce fwd variance | ~5-10% on Stage 2 | N/A | Already in codebase |
+| 7 | Optimizer FP8 | ~5% overall | N/A | Needs validation |
