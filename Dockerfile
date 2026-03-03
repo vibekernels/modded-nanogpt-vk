@@ -41,6 +41,14 @@ if [ -n "$PUBLIC_KEY" ]; then\n\
   echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys\n\
   chmod 600 /root/.ssh/authorized_keys\n\
 fi\n\
+# Snapshot container env vars so SSH sessions inherit them.\n\
+# sshd child processes do not inherit PID 1 environment;\n\
+# bash sources ~/.bashrc when invoked by sshd, so we load the\n\
+# snapshot from there.\n\
+printenv | grep -E "^[A-Z_][A-Z0-9_]*=" | grep -v "^PUBLIC_KEY=" | \\\n\
+  awk -F = '"'"'{ val=$0; sub(/^[^=]*=/, "", val); print "export " $1 "=\\\"" val "\\\"" }'"'"' > /etc/rp_environment\n\
+grep -q "source /etc/rp_environment" /root/.bashrc 2>/dev/null || \\\n\
+  echo "source /etc/rp_environment" >> /root/.bashrc\n\
 /usr/sbin/sshd\n\
 sleep infinity\n' > /start.sh && chmod +x /start.sh
 
