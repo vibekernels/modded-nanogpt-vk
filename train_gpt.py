@@ -919,7 +919,7 @@ class NorMuonAndAdam:
         lr_factor = lr_tensor.to(torch.float32)
         p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
         p_precise = p_precise_raw.view(torch.float32)
-        mask = (grad * p_precise) >= 0
+        mask = (grad * p_precise) > 0
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
@@ -1058,6 +1058,7 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
+    attn_sinks: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -1080,6 +1081,7 @@ class CausalSelfAttention(nn.Module):
         yarn = attn_args.yarn
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
+        attn_sinks_w = attn_args.attn_sinks
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
@@ -1124,10 +1126,14 @@ class CausalSelfAttention(nn.Module):
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y, lse = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0),
+                                                        return_attn_probs=True)
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # GPT-OSS attention sinks: gate output using LSE - learned sink bias
+        lse = lse.detach().bfloat16().view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(lse - attn_sinks_w.view(1, 1, self.num_heads, 1))
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
@@ -1167,6 +1173,8 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        # GPT-OSS attention sinks: learned per-head bias on LSE gating @gpt-oss
+        self.attn_sinks = nn.Parameter(torch.zeros(10, num_heads)) # 10 attention layers
 
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
@@ -1285,7 +1293,9 @@ class GPT(nn.Module):
         bigram_lambdas = self.bigram_lambdas.bfloat16().unbind(0)
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        ask = [w.bfloat16() for w in self.attn_sinks.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
+        sink_list = ask[:6] + [None] + ask[6:]
         ve_gates = [None] + [veg[0], veg[1]] + [None] * (self.num_layers - 6) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
@@ -1331,7 +1341,8 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
+                attn_sinks=sink_list[i]
             )
             # Select weights from banks
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
@@ -1730,6 +1741,7 @@ class TrainingManager():
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
+            "attn_sinks":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
@@ -1743,7 +1755,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "attn_sinks", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
