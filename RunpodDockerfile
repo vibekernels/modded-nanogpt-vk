@@ -51,3 +51,4 @@ fi\n\
 sleep infinity\n' > /start.sh && chmod +x /start.sh
 
 CMD ["/start.sh"]
+# Built via GitHub Actions -> ghcr.io/vibekernels/modded-nanogpt-vk
