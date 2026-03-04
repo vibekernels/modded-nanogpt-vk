@@ -416,16 +416,17 @@ def _aol_prescale_A_kernel(
     A_ptr += batch_idx * a_stride_b
     s_ptr += batch_idx * s_stride_b
 
-    # Accumulate absolute row sum
-    row_sum = tl.zeros([1], dtype=tl.float32)
+    # Accumulate absolute row sum using BLOCK_K accumulator to avoid block/scalar mismatch
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
     for off in range(0, K, BLOCK_K):
         cols = off + tl.arange(0, BLOCK_K)
         mask = cols < K
         a_vals = tl.load(A_ptr + row_idx * a_stride_r + cols * a_stride_c, mask=mask, other=0.0)
-        row_sum += tl.sum(tl.abs(a_vals.to(tl.float32)))
+        acc += tl.where(mask, tl.abs(a_vals.to(tl.float32)), tl.zeros([BLOCK_K], dtype=tl.float32))
 
-    # rsqrt with clamp
-    s_val = tl.rsqrt(tl.maximum(row_sum, 1e-7))
+    # Reduce to scalar, rsqrt with clamp matching PyTorch version
+    row_sum = tl.sum(acc)
+    s_val = tl.minimum(tl.rsqrt(tl.maximum(row_sum, 1e-7)), 1e4)
     tl.store(s_ptr + row_idx, s_val)
 
 
