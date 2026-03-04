@@ -113,14 +113,21 @@ Added `tl.swizzle2d` grouped tile ordering to the `linear_relu_square_kernel` (M
 - Added `tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)` after both pid_m/pid_n computations in the persistent kernel loop
 - Changed `GROUP_SIZE_M=1` to `GROUP_SIZE_M=8` in the kernel launch
 
-**Results:**
+**Results (cross-pod):**
 
 | | Val Loss | Train Time | Step Avg (stage 1) |
 |---|----------|------------|-------------------|
 | Baseline | 3.2802 | 668s | ~265ms |
 | Swizzled MLP | 3.2814 | 675.9s | 258.7ms |
 
-**Outcome:** +7.9s slower overall despite stage 1 being ~6ms/step faster (258.7 vs ~265). The kernel already uses a persistent launch pattern (`grid = min(NUM_SMS, num_tiles)` with `tl.range` loop), which inherently provides good SM utilization. Swizzling within the persistent loop may actually hurt by breaking the sequential tile access pattern that TMA descriptors optimize for. The overhead likely comes from later stages where the batch size grows and the swizzle pattern interacts poorly with the TMA prefetch pipeline.
+**Results (controlled A/B, same pod):**
+
+| | Val Loss | Train Time | Step Avg |
+|---|----------|------------|----------|
+| Baseline | 3.2794 | 679.2s | 455.87ms |
+| Swizzled MLP | 3.2777 | 678.5s | 455.35ms |
+
+**Outcome:** Controlled A/B test on the same H100 SXM shows a 0.8s difference (0.1%) — within noise. The 7.9s gap in the cross-pod comparison was hardware variance, not a real effect. The kernel already uses a persistent launch pattern (`grid = min(NUM_SMS, num_tiles)` with `tl.range` loop) with TMA descriptors, which inherently provides good SM utilization and memory access scheduling. Swizzling adds no value here.
 
 **Key learnings:**
 - Persistent kernels with TMA descriptors may not benefit from swizzled tile ordering — TMA's hardware prefetch already handles memory access scheduling
