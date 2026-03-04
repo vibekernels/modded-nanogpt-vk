@@ -99,6 +99,36 @@ Fuse AOL preconditioning into dedicated Triton kernels to eliminate PyTorch disp
 
 ---
 
+## Swizzled Tile Ordering for MLP GEMM Kernel
+
+**Date:** 2026-03-04
+**Branch:** `triton-swizzle-mlp` (`b2334db`)
+**Status:** No improvement
+
+Added `tl.swizzle2d` grouped tile ordering to the `linear_relu_square_kernel` (MLP GEMM) and increased `GROUP_SIZE_M` from 1 to 8. The symmetric matmul kernels (XXT, XTX, ba_plus_cAA) already used swizzling; this was the only GEMM-like kernel without it.
+
+**Hypothesis:** Swizzled tile ordering makes consecutive thread blocks process spatially adjacent tiles, improving L2 cache hit rates for weight matrix columns. Expected 0.7–1.5s savings across 1490 steps.
+
+**Changes:**
+- Added `tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)` after both pid_m/pid_n computations in the persistent kernel loop
+- Changed `GROUP_SIZE_M=1` to `GROUP_SIZE_M=8` in the kernel launch
+
+**Results:**
+
+| | Val Loss | Train Time | Step Avg (stage 1) |
+|---|----------|------------|-------------------|
+| Baseline | 3.2802 | 668s | ~265ms |
+| Swizzled MLP | 3.2814 | 675.9s | 258.7ms |
+
+**Outcome:** +7.9s slower overall despite stage 1 being ~6ms/step faster (258.7 vs ~265). The kernel already uses a persistent launch pattern (`grid = min(NUM_SMS, num_tiles)` with `tl.range` loop), which inherently provides good SM utilization. Swizzling within the persistent loop may actually hurt by breaking the sequential tile access pattern that TMA descriptors optimize for. The overhead likely comes from later stages where the batch size grows and the swizzle pattern interacts poorly with the TMA prefetch pipeline.
+
+**Key learnings:**
+- Persistent kernels with TMA descriptors may not benefit from swizzled tile ordering — TMA's hardware prefetch already handles memory access scheduling
+- The `GROUP_SIZE_M=1` was likely intentional for this kernel's persistent + TMA design
+- Swizzling is most beneficial for non-persistent kernels with explicit pointer arithmetic (like the symmetric matmul kernels that already use it)
+
+---
+
 <!-- Template for new experiments:
 
 ## Experiment Name
