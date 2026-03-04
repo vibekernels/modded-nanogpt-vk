@@ -80,3 +80,4 @@ The training loop has a ~7-minute warmup that compiles the model and warms Trito
 - Validation runs every 250 steps on 10.48M fixed tokens
 - `grad_accum_steps = 8 // world_size` — always 8 effective accumulation steps regardless of GPU count
 - The codebase uses `torch.compile` and `torch._dynamo` extensively; `recompile_limit` is set to 64
+- Current best performance (1xH100): **val loss 3.2802, train time 668s**. Compare experimental runs against these baselines to determine whether optimizations are beneficial — lower loss or faster training (without regressing the other) indicates a win
