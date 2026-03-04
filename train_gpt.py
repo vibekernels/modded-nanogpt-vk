@@ -32,7 +32,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-torch._inductor.config.cpp_wrapper = True # Use C++ wrapper to eliminate Python dispatch overhead between kernels
 from kernels import get_kernel
 from torch import Tensor, nn
 
