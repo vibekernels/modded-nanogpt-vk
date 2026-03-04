@@ -29,6 +29,8 @@ Docker image is built via GitHub Actions on push to `master` and published to `g
 
 **Pod readiness**: Do not rely on `runpodctl` status checks to determine if a pod is ready — they have a known bug. Instead, poll by attempting to SSH into the pod (e.g., `ssh -o ConnectTimeout=5 ...`) until the connection succeeds.
 
+**GPU type**: ONLY use H100 SXM GPUs for experiments, to ensure comparable benchmarks across runs.
+
 ## Architecture
 
 ### Two-File Design
