@@ -52,5 +52,7 @@ grep -q "source /etc/rp_environment" /root/.bashrc 2>/dev/null || \\\n\
 /usr/sbin/sshd\n\
 sleep infinity\n' > /start.sh && chmod +x /start.sh
 
+EXPOSE 22
+
 CMD ["/start.sh"]
 # Built via GitHub Actions -> ghcr.io/vibekernels/modded-nanogpt-vk
