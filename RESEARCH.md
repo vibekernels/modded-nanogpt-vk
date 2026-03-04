@@ -129,6 +129,97 @@ Added `tl.swizzle2d` grouped tile ordering to the `linear_relu_square_kernel` (M
 
 ---
 
+## Inductor cpp_wrapper Mode
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** Failed (crash)
+
+Enabled `torch._inductor.config.cpp_wrapper = True` to replace Python wrapper code managing kernel launches with compiled C++ code calling `cuLaunchKernel` directly, bypassing the Python interpreter and GIL between every kernel.
+
+**Hypothesis:** Intel benchmarks show 5-17% speedup for BF16 small workloads (iteration time <=40ms). Our 768-dim model has many short kernels where Python dispatch overhead is a measurable fraction of total time. Expected 1-3s savings.
+
+**Changes:**
+- Single line: `torch._inductor.config.cpp_wrapper = True` after line 34
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline | 3.2792 | 680s |
+| cpp_wrapper | CRASH | N/A |
+
+**Outcome:** Crashed during compilation with `RuntimeError: Failed to run autotuning code block: invalid decimal literal (<string>, line 7077)`. The C++ codegen is incompatible with this codebase's custom FP8 operators (`mm_t_op`, `mm_op`) and Triton kernel autotuning blocks. The cpp_wrapper's code generation produces invalid C++ for the complex autotuning paths used by FP8 `_scaled_mm` and custom Triton kernels.
+
+**Possible follow-ups:**
+- May work in a future PyTorch version with better cpp_wrapper + custom op support
+- Could selectively apply cpp_wrapper only to sub-graphs that don't use FP8 ops (not currently supported)
+
+---
+
+## EMA Weight Averaging
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement
+
+Maintained an exponential moving average of model parameters during training, swapping in EMA weights for validation. Tested decay rates of 0.995 and 0.99.
+
+**Hypothesis:** EMA smooths out parameter oscillations, effectively replacing the LR cooldown phase. Could allow all steps to train at high LR while EMA captures the underlying progress. Expected 30-75 fewer effective steps needed (1.5-3.5s savings).
+
+**Changes:**
+- After warmup: `ema_state = {k: v.clone() for k, v in model.state_dict().items()}`
+- After each optimizer step: `ema_state[k].lerp_(v, 1 - ema_decay)`
+- Swap EMA weights in for validation, restore live weights after
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2792 | 680.3s |
+| EMA decay=0.995 | 3.4500 | 679.4s |
+| EMA decay=0.99 | 3.3456 | 680.4s |
+
+**Outcome:** Both decay rates produced significantly worse val loss. The 0.995 decay over-smooths dramatically (+0.17 loss), while 0.99 is better but still +0.066 above baseline. The ~8ms/step overhead from state_dict copies and lerp updates is modest but adds up.
+
+The fundamental issue: EMA conflicts with the aggressive multi-stage training schedule. The codebase uses sharp batch size transitions (8->16->24), MTP head pruning, embed/lm_head splitting at 2/3, and YaRN window extensions. EMA weights lag behind these transitions, blending pre-transition and post-transition parameters in a way that hurts rather than helps. The existing 60% linear cooldown is already well-tuned for these dynamics.
+
+**Possible follow-ups:**
+- EMA only during the cooldown phase (not the full run) to avoid transition interference
+- Per-parameter-group EMA with different decay rates for banks vs scalars
+- LAWA (Latest Weight Averaging) — average last K checkpoints instead of exponential
+
+---
+
+## Cosine Cooldown Shape
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement (neutral)
+
+Replaced the linear LR cooldown with cosine decay: `t_cos = 0.5 * (1 - cos(pi * t))` providing slower initial decay and faster decay at the end.
+
+**Hypothesis:** Different cooldown shapes create distinct bias-variance tradeoffs. Cosine cooldown maintains higher LR longer in the early cooldown phase, allowing more learning before rapid convergence at the end. Expected 10-30 step equivalent gain (0.5-1.5s).
+
+**Changes:**
+- In `get_lr()`: replaced `lr = lr * (1 - t) + 0.15 * t` with cosine-shaped interpolation
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2792 | 680.3s |
+| Cosine cooldown | 3.2841 | 680.9s |
+
+**Outcome:** Val loss +0.005 worse, well within run-to-run noise. Training time identical (as expected — no compute change). The linear cooldown with 60% fraction is already well-optimized for this codebase. The cosine shape's slower initial decay means higher LR for longer, which doesn't help when the batch size schedule already provides the right effective LR progression.
+
+**Possible follow-ups:**
+- Try sqrt cooldown (`t_sqrt = sqrt(t)`) — faster initial decay, may help stabilize the large-batch stage 3
+- Try 1-sqrt cooldown — even slower initial decay than cosine
+- Cooldown fraction tuning (55% vs 60% vs 65%) may matter more than the shape
+
+---
+
 <!-- Template for new experiments:
 
 ## Experiment Name
