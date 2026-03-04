@@ -372,6 +372,60 @@ In the parallel residual region (layers 7-10), snapshot lane1 before attention m
 
 ---
 
+## Separate Residual Lambdas Per Lane
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement
+**Source:** [PR #230](https://github.com/KellerJordan/modded-nanogpt/pull/230) — msisovic
+
+Currently both lanes share the same residual lambda per layer. Expanded `resid_lambdas` from `(num_layers, 2)` to `(num_layers, 2, 2)` — [layer, attn/mlp, lane0/lane1] — so each lane gets independent residual scaling.
+
+**Hypothesis:** Logged lambda values show lanes develop very different characteristics in the parallel region. Independent lambdas should let each lane find its optimal residual scaling. Only adds 22 extra scalar parameters.
+
+**Changes:**
+- Changed `resid_lambdas` shape from `(num_layers, 2)` to `(num_layers, 2, 2)`
+- Split unbinding into per-lane variants: `resid_lambdas_attn_ln0`, `resid_lambdas_attn_ln1`, etc.
+- Updated all usage sites in sequential and parallel regions
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| Separate lambdas | 3.2812 | 680.4s |
+
+**Outcome:** Val loss +0.0023, within noise. The extra degrees of freedom don't help — the model has enough flexibility through `post_lambdas` (which already has per-lane scaling) that per-lane residual lambdas are redundant. The `post_lambdas` already control per-lane contribution from attention and MLP outputs, while `resid_lambdas` controls the residual connection strength, which should logically be the same for both lanes since they share the same residual stream initially.
+
+---
+
+## Combined: Gate lr_mul=5.0 + Parallel MLP/Attn
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement (not additive)
+
+Combined the two most promising individual changes: gate lr_mul=5.0 (best loss: -0.0018) and parallel MLP/attn (best speed: -2.7s).
+
+**Hypothesis:** If the improvements are independent, we should get both better loss and faster training.
+
+**Changes:**
+- `lr_mul: 5.0` for `attn_gate_bank` and `ve_gate_bank`
+- Snapshot `lane1_pre` before attention, feed to MLP for concurrent execution
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| Gate lr_mul=5.0 only | 3.2771 | 684.3s |
+| Parallel MLP only | 3.2826 | 679.0s |
+| Combined | 3.2805 | 680.4s |
+
+**Outcome:** Not additive. The parallel MLP's loss regression (+0.0037) partially cancelled the gate lr improvement (-0.0018), yielding a net +0.0016 — within noise. The faster gate learning may be less effective when MLP receives stale lane1, since the gates need to compensate for the different information flow.
+
+---
+
 <!-- Template for new experiments:
 
 ## Experiment Name
