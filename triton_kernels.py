@@ -397,6 +397,187 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
+# Fused AOL preconditioning kernel for Turbo-Muon
+# Computes s = rsqrt(abs(A).sum(dim=-1)) and applies diagonal scaling
+# to both A (in-place) and X, avoiding multiple PyTorch dispatch calls.
+
+@triton.jit
+def _aol_prescale_A_kernel(
+    A_ptr, s_ptr,
+    K,
+    a_stride_b, a_stride_r, a_stride_c,
+    s_stride_b,
+    BLOCK_K: tl.constexpr,
+):
+    """Phase 1: Compute s[j] = rsqrt(sum_k |A[j,k]|) and store to s_ptr."""
+    batch_idx = tl.program_id(1)
+    row_idx = tl.program_id(0)
+
+    A_ptr += batch_idx * a_stride_b
+    s_ptr += batch_idx * s_stride_b
+
+    # Accumulate absolute row sum
+    row_sum = tl.zeros([1], dtype=tl.float32)
+    for off in range(0, K, BLOCK_K):
+        cols = off + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        a_vals = tl.load(A_ptr + row_idx * a_stride_r + cols * a_stride_c, mask=mask, other=0.0)
+        row_sum += tl.sum(tl.abs(a_vals.to(tl.float32)))
+
+    # rsqrt with clamp
+    s_val = tl.rsqrt(tl.maximum(row_sum, 1e-7))
+    tl.store(s_ptr + row_idx, s_val.to(tl.bfloat16))
+
+
+@triton.jit
+def _aol_scale_A_kernel(
+    A_ptr, s_ptr,
+    K,
+    a_stride_b, a_stride_r, a_stride_c,
+    s_stride_b,
+    BLOCK_K: tl.constexpr,
+):
+    """Phase 2: Scale A[i,j] *= s[i] * s[j] in-place."""
+    batch_idx = tl.program_id(1)
+    row_idx = tl.program_id(0)
+
+    A_ptr += batch_idx * a_stride_b
+    s_ptr += batch_idx * s_stride_b
+
+    s_i = tl.load(s_ptr + row_idx).to(tl.float32)
+
+    for off in range(0, K, BLOCK_K):
+        cols = off + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        a_vals = tl.load(A_ptr + row_idx * a_stride_r + cols * a_stride_c, mask=mask, other=0.0).to(tl.float32)
+        scaled = (a_vals * s_i * s_j).to(tl.bfloat16)
+        tl.store(A_ptr + row_idx * a_stride_r + cols * a_stride_c, scaled, mask=mask)
+
+
+@triton.jit
+def _aol_scale_X_cols_kernel(
+    X_ptr, s_ptr,
+    M, K,
+    x_stride_b, x_stride_r, x_stride_c,
+    s_stride_b,
+    BLOCK_K: tl.constexpr,
+):
+    """Scale columns of X: X[:,j] *= s[j] (for tall matrices where A = X^T @ X)."""
+    batch_idx = tl.program_id(1)
+    row_idx = tl.program_id(0)
+
+    X_ptr += batch_idx * x_stride_b
+    s_ptr += batch_idx * s_stride_b
+
+    for off in range(0, K, BLOCK_K):
+        cols = off + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        x_vals = tl.load(X_ptr + row_idx * x_stride_r + cols * x_stride_c, mask=mask, other=0.0).to(tl.float32)
+        scaled = (x_vals * s_j).to(tl.bfloat16)
+        tl.store(X_ptr + row_idx * x_stride_r + cols * x_stride_c, scaled, mask=mask)
+
+
+@triton.jit
+def _aol_scale_X_rows_kernel(
+    X_ptr, s_ptr,
+    M, K,
+    x_stride_b, x_stride_r, x_stride_c,
+    s_stride_b,
+    BLOCK_K: tl.constexpr,
+):
+    """Scale rows of X: X[i,:] *= s[i] (for wide matrices where A = X @ X^T)."""
+    batch_idx = tl.program_id(1)
+    row_idx = tl.program_id(0)
+
+    X_ptr += batch_idx * x_stride_b
+    s_ptr += batch_idx * s_stride_b
+
+    s_i = tl.load(s_ptr + row_idx).to(tl.float32)
+
+    for off in range(0, K, BLOCK_K):
+        cols = off + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        x_vals = tl.load(X_ptr + row_idx * x_stride_r + cols * x_stride_c, mask=mask, other=0.0).to(tl.float32)
+        scaled = (x_vals * s_i).to(tl.bfloat16)
+        tl.store(X_ptr + row_idx * x_stride_r + cols * x_stride_c, scaled, mask=mask)
+
+
+def aol_prescale(A: torch.Tensor, X: torch.Tensor, is_tall: bool):
+    """
+    Fused AOL preconditioning: compute diagonal scaling from Gram matrix A
+    and apply in-place to both A and X.
+
+    For tall matrices (is_tall=True): A = X^T @ X, scale columns of X
+    For wide matrices (is_tall=False): A = X @ X^T, scale rows of X
+    """
+    K_a = A.size(-1)  # A is square: (K, K) for tall, (M, M) for wide
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    a_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    x_batch_stride = X.stride(0) if X.ndim == 3 else 0
+
+    BLOCK_K = min(256, triton.next_power_of_2(K_a))
+
+    # Allocate scaling vector
+    if A.ndim == 3:
+        s = torch.empty((batch_size, K_a), device=A.device, dtype=torch.bfloat16)
+        s_batch_stride = s.stride(0)
+    else:
+        s = torch.empty((K_a,), device=A.device, dtype=torch.bfloat16)
+        s_batch_stride = 0
+
+    # Phase 1: compute s = rsqrt(abs(A).sum(dim=-1))
+    grid_s = (K_a, batch_size)
+    _aol_prescale_A_kernel[grid_s](
+        A, s,
+        K_a,
+        a_batch_stride, A.stride(-2), A.stride(-1),
+        s_batch_stride,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+
+    # Phase 2: scale A in-place
+    _aol_scale_A_kernel[grid_s](
+        A, s,
+        K_a,
+        a_batch_stride, A.stride(-2), A.stride(-1),
+        s_batch_stride,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+
+    # Phase 3: scale X in-place
+    M_x = X.size(-2)
+    K_x = X.size(-1)
+    BLOCK_K_X = min(256, triton.next_power_of_2(K_x))
+
+    if is_tall:
+        # Scale columns: X[:,j] *= s[j], grid over rows of X
+        grid_x = (M_x, batch_size)
+        _aol_scale_X_cols_kernel[grid_x](
+            X, s,
+            M_x, K_x,
+            x_batch_stride, X.stride(-2), X.stride(-1),
+            s_batch_stride,
+            BLOCK_K=BLOCK_K_X,
+            num_warps=4,
+        )
+    else:
+        # Scale rows: X[i,:] *= s[i], grid over rows of X
+        grid_x = (M_x, batch_size)
+        _aol_scale_X_rows_kernel[grid_x](
+            X, s,
+            M_x, K_x,
+            x_batch_stride, X.stride(-2), X.stride(-1),
+            s_batch_stride,
+            BLOCK_K=BLOCK_K_X,
+            num_warps=4,
+        )
+
+
+# -----------------------------------------------------------------------------
 # Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
 
 @triton.jit

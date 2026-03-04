@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from triton_kernels import XXT, XTX, ba_plus_cAA, aol_prescale, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -206,15 +206,14 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
         else:
             aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
 
+        # AOL preconditioning (fused Triton kernel) before first iteration
+        XTX(X, out=A)
+        aol_prescale(A, X, is_tall=True)  # in-place scaling of A and X
+
         # Perform the iterations
         for i, (a, b, c) in enumerate(turbo_muon_aol_coeffs):
-            XTX(X, out=A)  # A = X.T @ X
-            if i == 0:
-                # AOL diagonal preconditioning (Turbo-Muon, Boissin et al. 2025)
-                # Rescale X by diagonal matrix derived from Gram matrix row norms
-                s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), min=1e-7))
-                X = X * s.unsqueeze(-2)  # scale columns of X
-                A = A * s.unsqueeze(-1) * s.unsqueeze(-2)  # scale both dims of A
+            if i > 0:
+                XTX(X, out=A)  # A = X.T @ X (skip first, already computed for AOL)
             ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
 
             # Referencing X twice causes pytorch to make a defensive copy,
@@ -240,14 +239,14 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
         else:
             aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
+        # AOL preconditioning (fused Triton kernel) before first iteration
+        XXT(X, out=A)
+        aol_prescale(A, X, is_tall=False)  # in-place scaling of A and X
+
         # Perform the iterations
         for i, (a, b, c) in enumerate(turbo_muon_aol_coeffs):
-            XXT(X, out=A)  # A = X @ X.mT
-            if i == 0:
-                # AOL diagonal preconditioning (Turbo-Muon, Boissin et al. 2025)
-                s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), min=1e-7))
-                X = X * s.unsqueeze(-1)  # scale rows of X
-                A = A * s.unsqueeze(-1) * s.unsqueeze(-2)  # scale both dims of A
+            if i > 0:
+                XXT(X, out=A)  # A = X @ X.mT (skip first, already computed for AOL)
             ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
 
             if split_baddbmm:
