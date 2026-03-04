@@ -426,7 +426,7 @@ def _aol_prescale_A_kernel(
 
     # rsqrt with clamp
     s_val = tl.rsqrt(tl.maximum(row_sum, 1e-7))
-    tl.store(s_ptr + row_idx, s_val.to(tl.bfloat16))
+    tl.store(s_ptr + row_idx, s_val)
 
 
 @triton.jit
@@ -444,12 +444,12 @@ def _aol_scale_A_kernel(
     A_ptr += batch_idx * a_stride_b
     s_ptr += batch_idx * s_stride_b
 
-    s_i = tl.load(s_ptr + row_idx).to(tl.float32)
+    s_i = tl.load(s_ptr + row_idx)
 
     for off in range(0, K, BLOCK_K):
         cols = off + tl.arange(0, BLOCK_K)
         mask = cols < K
-        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0)
         a_vals = tl.load(A_ptr + row_idx * a_stride_r + cols * a_stride_c, mask=mask, other=0.0).to(tl.float32)
         scaled = (a_vals * s_i * s_j).to(tl.bfloat16)
         tl.store(A_ptr + row_idx * a_stride_r + cols * a_stride_c, scaled, mask=mask)
@@ -473,7 +473,7 @@ def _aol_scale_X_cols_kernel(
     for off in range(0, K, BLOCK_K):
         cols = off + tl.arange(0, BLOCK_K)
         mask = cols < K
-        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        s_j = tl.load(s_ptr + cols, mask=mask, other=0.0)
         x_vals = tl.load(X_ptr + row_idx * x_stride_r + cols * x_stride_c, mask=mask, other=0.0).to(tl.float32)
         scaled = (x_vals * s_j).to(tl.bfloat16)
         tl.store(X_ptr + row_idx * x_stride_r + cols * x_stride_c, scaled, mask=mask)
@@ -494,7 +494,7 @@ def _aol_scale_X_rows_kernel(
     X_ptr += batch_idx * x_stride_b
     s_ptr += batch_idx * s_stride_b
 
-    s_i = tl.load(s_ptr + row_idx).to(tl.float32)
+    s_i = tl.load(s_ptr + row_idx)
 
     for off in range(0, K, BLOCK_K):
         cols = off + tl.arange(0, BLOCK_K)
@@ -521,10 +521,10 @@ def aol_prescale(A: torch.Tensor, X: torch.Tensor, is_tall: bool):
 
     # Allocate scaling vector
     if A.ndim == 3:
-        s = torch.empty((batch_size, K_a), device=A.device, dtype=torch.bfloat16)
+        s = torch.empty((batch_size, K_a), device=A.device, dtype=torch.float32)
         s_batch_stride = s.stride(0)
     else:
-        s = torch.empty((K_a,), device=A.device, dtype=torch.bfloat16)
+        s = torch.empty((K_a,), device=A.device, dtype=torch.float32)
         s_batch_stride = 0
 
     # Phase 1: compute s = rsqrt(abs(A).sum(dim=-1))
