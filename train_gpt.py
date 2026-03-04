@@ -157,12 +157,13 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # -----------------------------------------------------------------------------
 # Polar Express
 
-# Turbo-Muon AOL preconditioning + 4-iteration Newton-Schulz coefficients
+# Turbo-Muon AOL preconditioning + 5-iteration Newton-Schulz coefficients
 # From flash-newton-schulz by thib-s (Boissin et al., 2025)
-# AOL diagonal preconditioning tightens the initial singular value distribution,
-# enabling convergence in 4 iterations instead of 5.
+# AOL diagonal preconditioning tightens the initial singular value distribution.
+# Using all 5 iterations with AOL for better convergence quality.
 # https://arxiv.org/abs/2512.04632
 turbo_muon_aol_coeffs = [
+    (4.0848, -6.8946, 2.9270),
     (3.9505, -6.3029, 2.6377),
     (3.7418, -5.5913, 2.3037),
     (2.8769, -3.1427, 1.2046),
