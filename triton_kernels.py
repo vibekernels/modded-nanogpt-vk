@@ -422,6 +422,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m = tile_id // num_pid_n
         pid_n = tile_id % num_pid_n
+        pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -435,6 +436,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         tile_id_c += NUM_SMS
         pid_m = tile_id // num_pid_n
         pid_n = tile_id % num_pid_n
+        pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
         offs_am_c = pid_m * BLOCK_SIZE_M
         offs_bn_c = pid_n * BLOCK_SIZE_N
 
@@ -504,7 +506,7 @@ def linear_relu_square(a, b, aux=None):
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=1,
+        GROUP_SIZE_M=8,
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
         num_stages=num_stages,
