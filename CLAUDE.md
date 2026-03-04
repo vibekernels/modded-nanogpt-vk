@@ -27,6 +27,8 @@ Docker image is built via GitHub Actions on push to `master` and published to `g
 
 **Experiment workflow**: For experimental code changes, do NOT rebuild the Docker image — it takes a very long time to build. Instead, create a RunPod pod using the latest existing Docker image and make code modifications directly on the pod via SSH/SCP. Edit files in-place on the pod before running training.
 
+**Pod readiness**: Do not rely on `runpodctl` status checks to determine if a pod is ready — they have a known bug. Instead, poll by attempting to SSH into the pod (e.g., `ssh -o ConnectTimeout=5 ...`) until the connection succeeds.
+
 ## Architecture
 
 ### Two-File Design
