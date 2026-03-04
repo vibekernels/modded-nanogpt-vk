@@ -66,10 +66,10 @@ Keep 5 NS iterations but use AOL preconditioning + Turbo-Muon coefficients inste
 ## Fused Triton AOL + 4-iter
 
 **Date:** 2026-03-04
-**Branch:** `turbo-muon-aol-fused` (`aa203a6`)
-**Status:** Failed (NaN)
+**Branch:** `turbo-muon-aol-fused` (`d6621e4`)
+**Status:** No improvement (fixed NaN, still slower than baseline)
 
-Fuse AOL preconditioning into dedicated Triton kernels to eliminate PyTorch dispatch overhead. Three kernels: `_aol_prescale_A_kernel` (compute row sums + rsqrt), `_aol_scale_A_kernel` (scale Gram matrix), `_aol_scale_X_{cols,rows}_kernel` (scale X). Combined with 4-iter Turbo-Muon coefficients.
+Fuse AOL preconditioning into dedicated Triton kernels to eliminate PyTorch dispatch overhead. Four kernels: `_aol_prescale_A_kernel` (compute row sums + rsqrt), `_aol_scale_A_kernel` (scale Gram matrix), `_aol_scale_X_{cols,rows}_kernel` (scale X). Combined with 4-iter Turbo-Muon coefficients.
 
 **Hypothesis:** The unfused AOL's overhead (5 PyTorch ops) dominates the savings from removing one NS iteration. Fusing into Triton eliminates dispatch overhead, making the 4-iter approach net positive.
 
@@ -78,19 +78,24 @@ Fuse AOL preconditioning into dedicated Triton kernels to eliminate PyTorch disp
 - Restructured `polar_express` loop: compute Gram matrix once for AOL before iteration loop
 - 4-iter Turbo-Muon coefficients (same as first experiment)
 
+**Bug fixes (2 iterations):**
+1. Initial version stored scaling vector `s` in bf16 → NaN divergence. Fixed by using fp32 for all `s` storage.
+2. `_aol_prescale_A_kernel` used `tl.zeros([1], ...)` accumulator, creating a block/scalar mismatch on `tl.store`. Under `torch.compile`, `identify_mutated_tensors` failed, causing incorrect codegen. Fixed by using a `[BLOCK_K]` accumulator with `tl.where` masking + `tl.sum` reduction to produce a proper scalar. Also added `clamp(max=1e4)` matching the non-fused version.
+
 **Results:**
 
 | | Val Loss | Train Time | Step Avg (stage 1) |
 |---|----------|------------|-------------------|
 | Baseline | 3.2802 | 668s | — |
-| Fused AOL 4-iter | **NaN** | 637.2s | 256.2ms |
+| Fused AOL 4-iter (bf16 s) | **NaN** | 637.2s | 256.2ms |
+| Fused AOL 4-iter (fp32 s, fixed) | 3.2808 | 678.4s | 258.0ms |
 
-**Outcome:** Training diverged to NaN by step 250. The fused kernel is numerically incorrect — likely a bug in the Triton AOL scaling kernels (possibly bf16 precision loss during the in-place rsqrt + multiply chain, or incorrect stride handling for batched tensors). The step_avg of 256ms confirms the fused approach is faster (vs 262ms unfused, 265ms baseline estimate), but the computation is wrong.
+**Outcome:** After fixing the Triton kernel, training converges correctly (val_loss 3.2808, essentially matching baseline). The fused approach is ~3.5s faster than unfused AOL (678s vs 682s) but still ~10s slower than baseline (668s). The AOL preconditioning overhead, even when fused into Triton, exceeds the savings from removing one NS iteration on these matrix sizes.
 
-**Possible follow-ups:**
-- Debug the Triton kernel: test with fp32 intermediates, verify stride math for batched tensors
-- Check if the in-place bf16 rsqrt accumulates too much error — the unfused PyTorch path may silently use fp32 intermediates
-- Simpler approach: just keep AOL ops in PyTorch but use `torch.compile` to let it fuse automatically
+**Key learnings:**
+- Triton `tl.zeros([1])` creates a block type that fails under `torch.compile` when stored to a scalar pointer — use `tl.zeros([BLOCK_K])` + `tl.sum` instead
+- Scaling vectors must be stored in fp32 even when the matrices are bf16
+- On small Gram matrices (768x768), even a single Triton kernel launch for preconditioning costs more than it saves by eliminating one fused NS iteration
 
 ---
 
