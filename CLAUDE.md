@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
 ### Docker
-Docker image is built via GitHub Actions on push to `master` and published to `ghcr.io/vibekernels/modded-nanogpt-vk`. The image targets RunPod with SSH access via `PUBLIC_KEY` env var. Prefer US regions for RunPod pods — container images load significantly faster there. Always terminate RunPod pods once they're no longer needed as they are expensive.
+Docker image is built via GitHub Actions on push to `master` and published to `ghcr.io/vibekernels/modded-nanogpt-vk`. The image targets RunPod with SSH access via `PUBLIC_KEY` env var. When creating pods with `runpodctl`, use `--ports "22/tcp"` to get full SSH (with SCP/SFTP support) rather than RunPod's proxied basic SSH. Prefer US regions for RunPod pods — container images load significantly faster there. Always terminate RunPod pods once they're no longer needed as they are expensive.
 
 ## Architecture
 

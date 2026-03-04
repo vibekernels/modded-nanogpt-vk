@@ -5,7 +5,7 @@ A fork of [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) optim
 ## Running on RunPod
 
 ```bash
-runpodctl pod create --name modded-nanogpt-vk --image ghcr.io/vibekernels/modded-nanogpt-vk:latest --gpu-id "NVIDIA H100 80GB HBM3" --gpu-count 1 --container-disk-in-gb 50
+runpodctl pod create --name modded-nanogpt-vk --image ghcr.io/vibekernels/modded-nanogpt-vk:latest --gpu-id "NVIDIA H100 80GB HBM3" --gpu-count 1 --container-disk-in-gb 50 --ports "22/tcp"
 ```
 
 ## Training
