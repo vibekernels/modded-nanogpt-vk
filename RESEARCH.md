@@ -220,6 +220,158 @@ Replaced the linear LR cooldown with cosine decay: `t_cos = 0.5 * (1 - cos(pi * 
 
 ---
 
+## Fix CWD Mask in NorMuon Path (>= vs >)
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement (neutral)
+**Source:** [PR #172](https://github.com/KellerJordan/modded-nanogpt/pull/172) — ClassicLarry
+
+The Adam CWD path uses `>` (correct — zero gradients don't trigger weight decay). The NorMuon CWD path in `_cautious_wd_and_update_inplace` uses `>=`, which means parameters with zero gradients still get weight decay applied.
+
+**Hypothesis:** For sparse embeddings processed by NorMuon, `>=` drives rarely-seen token embeddings toward zero. Fixing to `>` should preserve rare token embeddings better. Expected 0.3-0.9s from better embedding quality.
+
+**Changes:**
+- Line 922: `mask = (grad * p_precise) >= 0` changed to `mask = (grad * p_precise) > 0`
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| CWD >= to > fix | 3.2796 | 682.4s |
+
+**Outcome:** Val loss +0.0007, well within noise. No measurable effect. The NorMuon path primarily handles the large weight banks (`attn_bank`, `mlp_bank`), which don't have sparse gradients — they always receive dense gradient updates. The sparse embedding parameters are handled by Adam (which already uses `>`), so the fix has minimal impact.
+
+---
+
+## Gate Learning Rate Multiplier Tuning
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** Possible small improvement at lr_mul=5.0
+**Source:** [PR #117](https://github.com/KellerJordan/modded-nanogpt/pull/117), [PR #146](https://github.com/KellerJordan/modded-nanogpt/pull/146) — varunneal, YouJiacheng
+
+Added `lr_mul` to `attn_gate_bank` and `ve_gate_bank` in param_table. These gates currently inherit the default Adam LR (0.008). YouJiacheng found 0.1x was critical for the 2.92 track under Muon, but they were never re-tuned after moving to Adam.
+
+**Hypothesis:** Gates may learn too slowly at the default LR, or the optimal rate under Adam differs from the Muon-era setting.
+
+**Changes:**
+- Added `"lr_mul": X` to both `attn_gate_bank` and `ve_gate_bank` entries
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| lr_mul=0.1 | 3.2800 | 679.2s |
+| lr_mul=5.0 | **3.2771** | 684.3s |
+
+**Outcome:** lr_mul=0.1 (slower gates) was neutral. lr_mul=5.0 (faster gates) showed -0.0018 improvement — small but the intermediate checkpoints were also consistently better than baseline at every validation point. The faster gate learning helps the model more quickly identify which heads should attend and which should be suppressed. The 5.0x multiplier matches the `scalars` and `resid_lambdas` lr_mul values, suggesting these small control parameters benefit from faster learning.
+
+**Possible follow-ups:**
+- Test lr_mul=10.0 to see if further acceleration helps
+- Combine with other improvements once a clear win is established
+- Test on 8xH100 to see if effect holds at the competition configuration
+- Statistical significance: needs multiple runs to confirm -0.0018 is real
+
+---
+
+## GPT-OSS Attention Sinks (Simplified)
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement / Implementation blocked
+**Source:** [PR #117](https://github.com/KellerJordan/modded-nanogpt/pull/117) — ClassicLarry, byronxu99
+
+GPT-OSS sinks multiply attention output by `sigmoid(LSE - learned_sink)`, equivalent to adding a learned null key to the softmax denominator. This lets heads express "I found nothing useful" independently of the existing sparse gate.
+
+**Hypothesis:** The sparse gate and sinks are complementary — gate decides "should I look?", sinks decide "did I find anything?". Expected 0.6-1.8s from combining both.
+
+**Implementation challenges:**
+1. Flash Attention 3's `flash_attn_varlen_func` wrapper doesn't expose `return_softmax_lse` — the internal `FlashAttnVarlenFunc` supports `return_softmax=True` but the wrapper maps it via `return_attn_probs` which conflicts with `torch.compile` tracing
+2. Adding kwargs to the attention function's `forward()` breaks `torch.compile` (dynamo) — had to route through `AttnArgs` dataclass instead
+3. LSE shape from varlen FA3 is `(num_heads, total_seqlen)`, requiring transpose + reshape that varies between paired/non-paired head configurations
+
+Due to these issues, tested a simplified version: per-head learned scale `y * sigmoid(-sink)` without LSE dependency. This is a weaker version that doesn't capture position-dependent attention confidence.
+
+**Changes:**
+- Added `attn_sinks` parameter (10, num_heads) initialized to zeros
+- Applied `sigmoid(-attn_sink)` as per-head scale before existing gate
+- Added to param_table, work_order, and bf16 conversion
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| Simplified sinks | 3.2823 | 687.6s |
+
+**Outcome:** Slightly worse (+0.0034 loss, +6s time). The simplified version without LSE is redundant with the existing sparse gate — both are just learned per-head scales. The real GPT-OSS mechanism requires position-dependent gating via LSE, which is blocked by the FA3 varlen API + torch.compile interaction.
+
+**Possible follow-ups:**
+- Patch `flash_attn_varlen_func` wrapper to pass through `return_softmax` correctly
+- Use `torch.compiler.allow_in_graph` to wrap the FA3 call and handle the tuple return
+- Try computing LSE approximation from attention output statistics (e.g., per-head output norm)
+
+---
+
+## Less-Cautious Weight Decay
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement
+**Source:** [PR #172](https://github.com/KellerJordan/modded-nanogpt/pull/172) — shenberg
+
+Standard cautious weight decay (CWD) blocks all weight decay when the update direction disagrees with the parameter sign. A less-cautious variant allows weight decay unless it would both flip the sign AND exceed the update magnitude.
+
+**Hypothesis:** Standard CWD is too conservative — it prevents weight decay even when the decay is small relative to the update. Less-cautious WD should improve regularization quality. Expected 0.3-0.9s.
+
+**Changes:**
+- Adam CWD mask changed from `(update * p_slice) > 0` to `((update * p_slice) > 0) | ((update * p_slice) < p_slice.square() * (-eff_wd))`
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| Less-cautious WD | 3.2824 | 681.7s |
+
+**Outcome:** Val loss +0.0035 worse, within noise. The existing CWD behavior is well-tuned for this training setup. With only 1490 steps and aggressive batch size scaling, the conservative WD approach that avoids conflicting with gradient direction appears optimal. The additional weight decay from the less-cautious variant may slightly harm the rapid schedule transitions.
+
+---
+
+## Parallelize MLP and Attention in Parallel Region
+
+**Date:** 2026-03-04
+**Branch:** N/A (tested on RunPod only)
+**Status:** No improvement (mixed — faster but worse loss)
+**Source:** [PR #230](https://github.com/KellerJordan/modded-nanogpt/pull/230) — ClassicLarry, msisovic
+
+In the parallel residual region (layers 7-10), snapshot lane1 before attention modifies it and feed the pre-attn version to MLP. This removes the sequential dependency between attention and MLP, potentially allowing CUDA to schedule them concurrently.
+
+**Hypothesis:** Lambda values show MLP largely ignores the sequential dependency. Parallelization should yield 0.3-1.0s speedup with minimal convergence impact.
+
+**Changes:**
+- Added `lane1_pre = lane1` snapshot before attention
+- MLP reads `norm(lane1_pre)` instead of `norm(lane1)` (which includes attention's update)
+
+**Results:**
+
+| | Val Loss | Train Time |
+|---|----------|------------|
+| Baseline (this pod) | 3.2789 | 681.7s |
+| Parallel MLP/attn | 3.2826 | 679.0s |
+
+**Outcome:** Mixed result. Training was 2.7s faster (consistent with some kernel overlap), but val loss regressed by +0.0037. On 1xGPU, CUDA has limited ability to truly parallelize two large operations, so the speedup is modest. The loss regression suggests that despite lambda analysis showing weak dependency, MLP does extract some value from seeing attention-modified lane1 — particularly in the later layers where attention amplifies lane1 by ~2.2x.
+
+**Possible follow-ups:**
+- Only parallelize layers 7-8 (earliest parallel layers where dependency is weakest)
+- Try on 8xH100 where communication overhead may make the speedup more valuable
+- Statistical significance test — the loss difference may be within noise
+
+---
+
 <!-- Template for new experiments:
 
 ## Experiment Name
