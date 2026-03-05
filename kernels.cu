@@ -969,6 +969,49 @@ void rope_apply(bf16* x, const bf16* cos_table, const bf16* sin_table,
     rope_apply_kernel<<<T, threads, 0, stream>>>(x, cos_table, sin_table, T, num_heads, head_dim);
 }
 
+// RoPE backward: applies transpose of rotation matrix
+// Forward:  y0 = c0*x0 + s0*x1,  y1 = c1*x1 + s1*x0
+// Backward: dx0 = c0*dy0 + s1*dy1, dx1 = s0*dy0 + c1*dy1
+__global__ void rope_backward_kernel(bf16* __restrict__ dx,
+                                      const bf16* __restrict__ dy,
+                                      const bf16* __restrict__ cos_table,
+                                      const bf16* __restrict__ sin_table,
+                                      int T, int num_heads, int head_dim) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    int half_hd = head_dim / 2;
+    int total_pairs = num_heads * half_hd;
+
+    for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
+        int h = pair / half_hd;
+        int d = pair % half_hd;
+
+        int idx_base = t * num_heads * head_dim + h * head_dim;
+        int idx0 = idx_base + 2 * d;
+        int idx1 = idx_base + 2 * d + 1;
+        int tab_idx = t * head_dim + 2 * d;
+
+        float dy0 = bf16_to_f(dy[idx0]);
+        float dy1 = bf16_to_f(dy[idx1]);
+        float c0 = bf16_to_f(cos_table[tab_idx]);
+        float c1 = bf16_to_f(cos_table[tab_idx + 1]);
+        float s0 = bf16_to_f(sin_table[tab_idx]);
+        float s1 = bf16_to_f(sin_table[tab_idx + 1]);
+
+        // Transpose of [[c0, s0], [s1, c1]] is [[c0, s1], [s0, c1]]
+        dx[idx0] = f_to_bf16(c0 * dy0 + s1 * dy1);
+        dx[idx1] = f_to_bf16(s0 * dy0 + c1 * dy1);
+    }
+}
+
+void rope_backward(bf16* dx, const bf16* dy, const bf16* cos_table, const bf16* sin_table,
+                   int T, int num_heads, int head_dim, cudaStream_t stream) {
+    int total_pairs = num_heads * head_dim / 2;
+    int threads = min(1024, ((total_pairs + 31) / 32) * 32);
+    rope_backward_kernel<<<T, threads, 0, stream>>>(dx, dy, cos_table, sin_table, T, num_heads, head_dim);
+}
+
 // Compute YaRN cos/sin tables
 __global__ void yarn_compute_tables_kernel(bf16* __restrict__ cos_out,
                                             bf16* __restrict__ sin_out,
@@ -1146,12 +1189,49 @@ __global__ void sigmoid_gate_kernel(bf16* __restrict__ out,
 }
 
 void sigmoid_gate(bf16* out, const bf16* x, const bf16* gate_w,
-                  int num_tokens, int in_dim, int out_dim, float scale,
-                  cudaStream_t stream) {
+                  int num_tokens, int in_dim, int out_dim, int x_stride,
+                  float scale, cudaStream_t stream) {
     dim3 grid(num_tokens);
     dim3 block(out_dim);
     sigmoid_gate_kernel<<<grid, block, 0, stream>>>(
-        out, x, gate_w, num_tokens, in_dim, out_dim, in_dim, scale);
+        out, x, gate_w, num_tokens, in_dim, out_dim, x_stride, scale);
+}
+
+// Variant: gate input = cat(x[:half_dim], y[:half_dim]) with separate strides
+// Used for VE gate on non-paired layers: cat(x[:6], ve[:6])
+__global__ void sigmoid_gate_2src_kernel(bf16* __restrict__ out,
+                                          const bf16* __restrict__ x,
+                                          const bf16* __restrict__ y,
+                                          const bf16* __restrict__ gate_w,
+                                          int num_tokens, int half_dim, int out_dim,
+                                          int x_stride, int y_stride, float scale) {
+    int t = blockIdx.x;
+    int o = threadIdx.x;
+    if (t >= num_tokens || o >= out_dim) return;
+
+    int in_dim = 2 * half_dim;
+    float sum = 0.0f;
+    // First half from x
+    for (int i = 0; i < half_dim; i++) {
+        sum += bf16_to_f(x[t * x_stride + i]) * bf16_to_f(gate_w[o * in_dim + i]);
+    }
+    // Second half from y
+    for (int i = 0; i < half_dim; i++) {
+        sum += bf16_to_f(y[t * y_stride + i]) * bf16_to_f(gate_w[o * in_dim + half_dim + i]);
+    }
+    float sigmoid_val = scale / (1.0f + expf(-sum));
+    out[t * out_dim + o] = f_to_bf16(sigmoid_val);
+}
+
+void sigmoid_gate_2src(bf16* out, const bf16* x, const bf16* y,
+                       const bf16* gate_w,
+                       int num_tokens, int half_dim, int out_dim,
+                       int x_stride, int y_stride, float scale,
+                       cudaStream_t stream) {
+    dim3 grid(num_tokens);
+    dim3 block(out_dim);
+    sigmoid_gate_2src_kernel<<<grid, block, 0, stream>>>(
+        out, x, y, gate_w, num_tokens, half_dim, out_dim, x_stride, y_stride, scale);
 }
 
 // ============================================================================
@@ -2235,19 +2315,193 @@ void naive_varlen_attention_backward(
 }
 
 // ============================================================================
+// Gate backward kernels
+// ============================================================================
+
+// Phase 1: Compute grad_sigmoid for gate backward
+// Grid: [T, H], Block: [128]
+__global__ void gate_sigmoid_grad_kernel(
+    float* __restrict__ grad_sigmoid,
+    const bf16* __restrict__ dY,
+    const bf16* __restrict__ Y,
+    const bf16* __restrict__ gate,
+    int T, int H, int HD, float scale)
+{
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= T || h >= H) return;
+
+    float dot = 0.0f;
+    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
+        int idx = t * H * HD + h * HD + d;
+        dot += bf16_to_f(dY[idx]) * bf16_to_f(Y[idx]);
+    }
+    dot = block_reduce_sum(dot);
+    if (threadIdx.x == 0) {
+        float g_val = bf16_to_f(gate[t * H + h]);
+        float sig = g_val / scale;
+        grad_sigmoid[t * H + h] = dot * scale * sig * (1.0f - sig);
+    }
+}
+
+void gate_sigmoid_grad(float* grad_sigmoid, const bf16* dY, const bf16* Y,
+                       const bf16* gate, int T, int H, int HD,
+                       float scale, cudaStream_t stream) {
+    dim3 grid(T, H);
+    int threads = min(128, HD);
+    gate_sigmoid_grad_kernel<<<grid, threads, 0, stream>>>(
+        grad_sigmoid, dY, Y, gate, T, H, HD, scale);
+}
+
+// Phase 2a: Gate weight gradient
+// Each thread handles one (h, f) pair, loops over T
+// Grid: [1], Block: [H * gate_dim]
+__global__ void gate_weight_grad_kernel(
+    bf16* __restrict__ g_gate_w,
+    const float* __restrict__ grad_sigmoid,
+    const bf16* __restrict__ x,
+    int T, int H, int D, int gate_dim)
+{
+    int idx = threadIdx.x;
+    if (idx >= H * gate_dim) return;
+    int h = idx / gate_dim;
+    int f = idx % gate_dim;
+
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) {
+        sum += grad_sigmoid[t * H + h] * bf16_to_f(x[t * D + f]);
+    }
+    g_gate_w[h * gate_dim + f] = f_to_bf16(bf16_to_f(g_gate_w[h * gate_dim + f]) + sum);
+}
+
+void gate_weight_grad(bf16* g_gate_w, const float* grad_sigmoid,
+                      const bf16* x, int T, int H, int D,
+                      int gate_dim, cudaStream_t stream) {
+    int n = H * gate_dim;
+    gate_weight_grad_kernel<<<1, n, 0, stream>>>(
+        g_gate_w, grad_sigmoid, x, T, H, D, gate_dim);
+}
+
+// Phase 2a (2-source variant): gate input is cat(x[:half_dim], y[:half_dim])
+__global__ void gate_weight_grad_2src_kernel(
+    bf16* __restrict__ g_gate_w,
+    const float* __restrict__ grad_sigmoid,
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ y,
+    int T, int H, int x_stride, int y_stride, int half_dim)
+{
+    int idx = threadIdx.x;
+    int in_dim = 2 * half_dim;
+    if (idx >= H * in_dim) return;
+    int h = idx / in_dim;
+    int f = idx % in_dim;
+
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) {
+        float feat;
+        if (f < half_dim) {
+            feat = bf16_to_f(x[t * x_stride + f]);
+        } else {
+            feat = bf16_to_f(y[t * y_stride + (f - half_dim)]);
+        }
+        sum += grad_sigmoid[t * H + h] * feat;
+    }
+    g_gate_w[h * in_dim + f] = f_to_bf16(bf16_to_f(g_gate_w[h * in_dim + f]) + sum);
+}
+
+void gate_weight_grad_2src(bf16* g_gate_w, const float* grad_sigmoid,
+                           const bf16* x, const bf16* y,
+                           int T, int H, int x_stride, int y_stride,
+                           int half_dim, cudaStream_t stream) {
+    int n = H * 2 * half_dim;
+    gate_weight_grad_2src_kernel<<<1, n, 0, stream>>>(
+        g_gate_w, grad_sigmoid, x, y, T, H, x_stride, y_stride, half_dim);
+}
+
+// Phase 2b: Gate input gradient
+// Grid: [T], Block: [32]
+__global__ void gate_input_grad_kernel(
+    bf16* __restrict__ grad_x,
+    const float* __restrict__ grad_sigmoid,
+    const bf16* __restrict__ gate_w,
+    int T, int H, int D, int gate_dim)
+{
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    for (int f = threadIdx.x; f < gate_dim; f += blockDim.x) {
+        float sum = 0.0f;
+        for (int h = 0; h < H; h++) {
+            sum += grad_sigmoid[t * H + h] * bf16_to_f(gate_w[h * gate_dim + f]);
+        }
+        grad_x[t * D + f] = f_to_bf16(bf16_to_f(grad_x[t * D + f]) + sum);
+    }
+}
+
+void gate_input_grad(bf16* grad_x, const float* grad_sigmoid,
+                     const bf16* gate_w, int T, int H, int D,
+                     int gate_dim, cudaStream_t stream) {
+    gate_input_grad_kernel<<<T, 32, 0, stream>>>(
+        grad_x, grad_sigmoid, gate_w, T, H, D, gate_dim);
+}
+
+// Phase 2b (2-source variant): gate input gradient for cat(x[:half_dim], ve[:half_dim])
+// Adds gradient to first half_dim dims of grad_x AND grad_ve
+// gate_w is [H, 2*half_dim] where [:, :half_dim] -> x, [:, half_dim:] -> ve
+__global__ void gate_input_grad_2src_kernel(
+    bf16* __restrict__ grad_x,
+    bf16* __restrict__ grad_ve,
+    const float* __restrict__ grad_sigmoid,
+    const bf16* __restrict__ gate_w,
+    int T, int H, int x_stride, int ve_stride, int half_dim)
+{
+    int t = blockIdx.x;
+    if (t >= T) return;
+    int full_dim = 2 * half_dim;
+
+    // x gradient: first half_dim columns of gate_w
+    for (int f = threadIdx.x; f < half_dim; f += blockDim.x) {
+        float sum = 0.0f;
+        for (int h = 0; h < H; h++) {
+            sum += grad_sigmoid[t * H + h] * bf16_to_f(gate_w[h * full_dim + f]);
+        }
+        grad_x[t * x_stride + f] = f_to_bf16(bf16_to_f(grad_x[t * x_stride + f]) + sum);
+    }
+    // ve gradient: second half_dim columns of gate_w
+    for (int f = threadIdx.x; f < half_dim; f += blockDim.x) {
+        float sum = 0.0f;
+        for (int h = 0; h < H; h++) {
+            sum += grad_sigmoid[t * H + h] * bf16_to_f(gate_w[h * full_dim + half_dim + f]);
+        }
+        grad_ve[t * ve_stride + f] = f_to_bf16(bf16_to_f(grad_ve[t * ve_stride + f]) + sum);
+    }
+}
+
+void gate_input_grad_2src(bf16* grad_x, bf16* grad_ve, const float* grad_sigmoid,
+                           const bf16* gate_w, int T, int H,
+                           int x_stride, int ve_stride, int half_dim,
+                           cudaStream_t stream) {
+    gate_input_grad_2src_kernel<<<T, 32, 0, stream>>>(
+        grad_x, grad_ve, grad_sigmoid, gate_w, T, H, x_stride, ve_stride, half_dim);
+}
+
+// ============================================================================
 // Scalar gradient accumulation (GPU-side)
 // ============================================================================
 
 // acc layout: [0..10] resid_attn, [11..21] resid_mlp, [22..32] x0_lambda,
-//   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
+//   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda,
+//   [89..110] sa_lambda (2 per layer: [89+2*i]=sa_lambda0, [89+2*i+1]=sa_lambda1),
+//   [111] skip_lambda raw dot (pre-multiplied by skip_lambda_factor in kernel)
 __global__ void accumulate_scalar_grads_kernel(
     bf16* resid_grads,       // [num_layers * 2]
     bf16* x0_grads,          // [num_layers]
     bf16* bigram_grads,      // [num_layers]
     bf16* post_lambda_grads, // [num_layers * 4]
     bf16* scalar_grads,      // [2*num_layers + 3]
-    const float* acc,        // [89] float accumulators
-    int num_layers)
+    const float* acc,        // [112] float accumulators
+    int num_layers,
+    float skip_lambda_factor) // (1 - sigmoid(skip_lambda_raw))
 {
     int i = threadIdx.x;
     if (i >= num_layers) return;
@@ -2270,20 +2524,32 @@ __global__ void accumulate_scalar_grads_kernel(
         post_lambda_grads[i * 4 + j] = __float2bfloat16(v);
     }
 
-    // backout_lambda: scalar_grads[2*num_layers+1] -= acc[88] (negated: forward was subtraction)
-    // Only one thread does this
+    // sa_lambdas: scalar_grads[2*i] += acc[89+2*i], scalar_grads[2*i+1] += acc[89+2*i+1]
+    float s0 = __bfloat162float(scalar_grads[2 * i]) + acc[89 + 2 * i];
+    float s1 = __bfloat162float(scalar_grads[2 * i + 1]) + acc[89 + 2 * i + 1];
+    scalar_grads[2 * i] = __float2bfloat16(s0);
+    scalar_grads[2 * i + 1] = __float2bfloat16(s1);
+
+    // backout_lambda and skip_lambda: only one thread does these
     if (i == 0) {
+        // backout_lambda: scalar_grads[2*num_layers+1] -= acc[88] (negated: forward was subtraction)
         int idx = 2 * num_layers + 1;
         float cur = __bfloat162float(scalar_grads[idx]);
         scalar_grads[idx] = __float2bfloat16(cur - acc[88]);
+
+        // skip_lambda: scalar_grads[2*num_layers+2] += skip_lambda_factor * acc[111]
+        int idx2 = 2 * num_layers + 2;
+        float cur2 = __bfloat162float(scalar_grads[idx2]);
+        scalar_grads[idx2] = __float2bfloat16(cur2 + skip_lambda_factor * acc[111]);
     }
 }
 
 void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
                              bf16* post_lambda_grads, bf16* scalar_grads,
-                             const float* acc, int num_layers, cudaStream_t stream) {
+                             const float* acc, int num_layers,
+                             float skip_lambda_factor, cudaStream_t stream) {
     // Single block, num_layers threads (11 threads)
     accumulate_scalar_grads_kernel<<<1, num_layers, 0, stream>>>(
         resid_grads, x0_grads, bigram_grads, post_lambda_grads, scalar_grads,
-        acc, num_layers);
+        acc, num_layers, skip_lambda_factor);
 }

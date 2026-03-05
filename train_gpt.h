@@ -299,6 +299,7 @@ typedef struct {
     bf16* saved_qkv[NUM_ATTN_LAYERS];     // [T, 3*H, HD] QKV after RMS norm + RoPE
     bf16* saved_attn_out[NUM_ATTN_LAYERS]; // [T, H, HD] output of attention before gating
     bf16* saved_attn_gate[NUM_ATTN_LAYERS];// [T, H] attention output gate values
+    bf16* saved_ve_gate[5];               // [T, H] or [T, H/2] VE gate values (5 VE layers)
 
     // Gradient scratch
     bf16* grad_x;               // gradient flowing backward [1, T, MODEL_DIM]

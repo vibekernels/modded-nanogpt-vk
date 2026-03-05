@@ -107,6 +107,10 @@ void transpose_add(const bf16* src, bf16* dst, int M, int N, cudaStream_t stream
 void rope_apply(bf16* x, const bf16* cos_table, const bf16* sin_table,
                 int T, int num_heads, int head_dim, cudaStream_t stream);
 
+// RoPE backward: applies transpose of rotation matrix
+void rope_backward(bf16* dx, const bf16* dy, const bf16* cos_table, const bf16* sin_table,
+                   int T, int num_heads, int head_dim, cudaStream_t stream);
+
 // Compute cos/sin tables for YaRN
 void yarn_compute_tables(bf16* cos_out, bf16* sin_out,
                          const float* angular_freq, int head_dim,
@@ -134,8 +138,15 @@ void bigram_hash(int32_t* out, const int32_t* input, int num_tokens, cudaStream_
 // Sigmoid gate: out = scale * sigmoid(linear(x_slice, gate_w))
 // x_slice: first `in_dim` features of x, gate_w: [out_dim, in_dim]
 void sigmoid_gate(bf16* out, const bf16* x, const bf16* gate_w,
-                  int num_tokens, int in_dim, int out_dim, float scale,
-                  cudaStream_t stream);
+                  int num_tokens, int in_dim, int out_dim, int x_stride,
+                  float scale, cudaStream_t stream);
+
+// Sigmoid gate with 2 source inputs: gate = scale * sigmoid(cat(x[:half_dim], y[:half_dim]) @ w.T)
+void sigmoid_gate_2src(bf16* out, const bf16* x, const bf16* y,
+                       const bf16* gate_w,
+                       int num_tokens, int half_dim, int out_dim,
+                       int x_stride, int y_stride, float scale,
+                       cudaStream_t stream);
 
 // ============================================================================
 // Elementwise kernels
@@ -272,6 +283,41 @@ void key_offset_shift(bf16* k, const int32_t* cu_seqlens, int num_seqs,
                       int total_T, int H, int HD, cudaStream_t stream);
 
 // ============================================================================
+// Gate backward kernels
+// ============================================================================
+
+// Phase 1: Compute grad_sigmoid for attention/VE gate backward
+// grad_sigmoid[t*H+h] = sum_d(dY[t,h,d]*Y[t,h,d]) * scale * sig * (1 - sig)
+// where sig = gate[t,h] / scale (recover sigmoid from gate = scale * sigmoid(u))
+void gate_sigmoid_grad(float* grad_sigmoid, const bf16* dY, const bf16* Y,
+                       const bf16* gate, int T, int H, int HD,
+                       float scale, cudaStream_t stream);
+
+// Phase 2a: Accumulate gate weight gradient
+// g_gate_w[h*gate_dim+f] += sum_t(grad_sigmoid[t*H+h] * x[t*D+f])
+void gate_weight_grad(bf16* g_gate_w, const float* grad_sigmoid,
+                      const bf16* x, int T, int H, int D,
+                      int gate_dim, cudaStream_t stream);
+
+// Phase 2a (2-source variant): gate input is cat(x[:half], y[:half])
+void gate_weight_grad_2src(bf16* g_gate_w, const float* grad_sigmoid,
+                           const bf16* x, const bf16* y,
+                           int T, int H, int x_stride, int y_stride,
+                           int half_dim, cudaStream_t stream);
+
+// Phase 2b: Add gate input gradient to grad_x[:, :gate_dim]
+// grad_x[t*D+f] += sum_h(grad_sigmoid[t*H+h] * gate_w[h*gate_dim+f])
+void gate_input_grad(bf16* grad_x, const float* grad_sigmoid,
+                     const bf16* gate_w, int T, int H, int D,
+                     int gate_dim, cudaStream_t stream);
+
+// Phase 2b (2-source variant): gate input gradient for cat(x[:half_dim], ve[:half_dim])
+void gate_input_grad_2src(bf16* grad_x, bf16* grad_ve, const float* grad_sigmoid,
+                           const bf16* gate_w, int T, int H,
+                           int x_stride, int ve_stride, int half_dim,
+                           cudaStream_t stream);
+
+// ============================================================================
 // Scalar gradient accumulation (GPU-side)
 // ============================================================================
 
@@ -281,4 +327,5 @@ void key_offset_shift(bf16* k, const int32_t* cu_seqlens, int num_seqs,
 // negate_backout: if true, subtract acc[88] instead of add (forward was subtraction)
 void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
                              bf16* post_lambda_grads, bf16* scalar_grads,
-                             const float* acc, int num_layers, cudaStream_t stream);
+                             const float* acc, int num_layers,
+                             float skip_lambda_factor, cudaStream_t stream);

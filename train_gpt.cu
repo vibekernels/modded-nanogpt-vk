@@ -1000,12 +1000,17 @@ static void alloc_grads(ModelGrads* g) {
     CUDA_CHECK(cudaMalloc(&g->scalars, (NUM_LAYERS * 2 + 3 + 1) * sizeof(bf16)));
 }
 
-static void zero_grads(ModelGrads* g, cudaStream_t stream) {
+static void zero_normuon_grads(ModelGrads* g, cudaStream_t stream) {
+    // Only zero NorMuon parameter grads (attn_bank, mlp_bank)
+    CUDA_CHECK(cudaMemsetAsync(g->attn_bank, 0, NUM_ATTN_LAYERS * 4 * MODEL_DIM * MODEL_DIM * sizeof(bf16), stream));
+    CUDA_CHECK(cudaMemsetAsync(g->mlp_bank, 0, MLP_BANK_SIZE * 2 * MLP_HDIM * MODEL_DIM * sizeof(bf16), stream));
+}
+
+static void zero_adam_grads(ModelGrads* g, cudaStream_t stream) {
+    // Zero Adam parameter grads (everything except attn_bank, mlp_bank)
     CUDA_CHECK(cudaMemsetAsync(g->embed, 0, VOCAB_SIZE * MODEL_DIM * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->bigram_embed, 0, BIGRAM_VOCAB_SIZE * MODEL_DIM * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->value_embeds, 0, 5 * VOCAB_SIZE * MODEL_DIM * sizeof(bf16), stream));
-    CUDA_CHECK(cudaMemsetAsync(g->attn_bank, 0, NUM_ATTN_LAYERS * 4 * MODEL_DIM * MODEL_DIM * sizeof(bf16), stream));
-    CUDA_CHECK(cudaMemsetAsync(g->mlp_bank, 0, MLP_BANK_SIZE * 2 * MLP_HDIM * MODEL_DIM * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->lm_head, 0, MODEL_DIM * VOCAB_SIZE * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->attn_gate_bank, 0, 10 * NUM_HEADS * 12 * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->ve_gate_bank, 0, 5 * NUM_HEADS * 12 * sizeof(bf16), stream));
@@ -1016,6 +1021,11 @@ static void zero_grads(ModelGrads* g, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(g->bigram_lambdas, 0, NUM_LAYERS * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->resid_lambdas, 0, NUM_LAYERS * 2 * sizeof(bf16), stream));
     CUDA_CHECK(cudaMemsetAsync(g->scalars, 0, (NUM_LAYERS * 2 + 3 + 1) * sizeof(bf16), stream));
+}
+
+static void zero_grads(ModelGrads* g, cudaStream_t stream) {
+    zero_normuon_grads(g, stream);
+    zero_adam_grads(g, stream);
 }
 
 // ============================================================================
@@ -1153,6 +1163,9 @@ static void alloc_activations(Activations* act, int max_tokens) {
     // Per-attn-layer saved (10 layers * 3 buffers)
     total += NUM_ATTN_LAYERS * ((size_t)T * 3 * H * HD * sizeof(bf16) + ALIGN + THD2 + ALIGN + (size_t)T * H * sizeof(bf16) + ALIGN);
     n_buffers += NUM_ATTN_LAYERS * 3;
+    // Saved VE gate values: 5 VE layers * [T, H] bf16
+    total += 5 * ((size_t)T * H * sizeof(bf16) + ALIGN);
+    n_buffers += 5;
     // Gradient scratch: 5 * T*D bf16
     total += 5 * (TD2 + ALIGN); n_buffers += 5;
     // cuDNN attn stats: [num_seqs, attn_H, s_max, 1] per attention layer
@@ -1241,6 +1254,9 @@ static void alloc_activations(Activations* act, int max_tokens) {
         BUMP(bf16, saved_attn_out[i], THD2);
         BUMP(bf16, saved_attn_gate[i], (size_t)T * H * sizeof(bf16));
     }
+    for (int i = 0; i < 5; i++) {
+        BUMP(bf16, saved_ve_gate[i], (size_t)T * H * sizeof(bf16));
+    }
 
     // Gradient scratch
     BUMP(bf16, grad_x, TD2);
@@ -1318,8 +1334,9 @@ static void attention_forward(TrainingContext* ctx, int layer, int attn_idx,
                               const bf16* qkvo_w,  // [4*D, D] row-major
                               float sa_lambda0, float sa_lambda1,
                               const bf16* attn_gate_w,  // [H, 12] or NULL
-                              const bf16* ve_gate_w,    // [H, 12] or NULL (regular) or [H/2, 12] (paired)
+                              const bf16* ve_gate_w,    // [H, 12] or NULL
                               const bf16* ve,           // [T, H, HD] or NULL (already looked up + reshaped)
+                              int ve_gate_idx,          // index into saved_ve_gate (-1 if no VE)
                               int32_t* cu_seqlens, int num_seqs, int num_tokens,
                               int max_seq_len, int window_size,
                               int is_paired, int key_offset_flag,
@@ -1363,18 +1380,16 @@ static void attention_forward(TrainingContext* ctx, int layer, int attn_idx,
 
         // Step 4c: Value embedding gating
         if (ve != NULL && ve_gate_w != NULL) {
-            // gate_input = cat(x[:, :6], ve_flat[:, :6]) -> [T, 12]
-            // gate = 2 * sigmoid(gate_input @ ve_gate_w.T) -> [T, H]
+            // gate = 2 * sigmoid(cat(x[:6], ve[:6]) @ ve_gate_w.T) -> [T, H]
             // v = v + gate.unsqueeze(-1) * ve.view(T, H, HD)
-            // We use sigmoid_gate which computes: out = scale * sigmoid(x_slice @ w.T)
-            // x_slice needs to be [x[:6], ve[:6]] concatenated
-            // For simplicity, compute the gate using only x[:12] (which covers both x[:6] and ve[:6]
-            // if ve is stored after x in a concatenated buffer)
-            // Actually, we need to properly concatenate. Let's use a simpler approach:
-            // Compute gate from x[:12] only (approximation matching paired path)
-            // The proper implementation would concatenate x[:6] and ve[:6]
-            sigmoid_gate(act->scratch2, x_in, ve_gate_w,
-                        T, 12, H, 2.0f, ctx->stream);
+            // ve is [T, D] (already gathered), use first 6 dims from x and ve
+            sigmoid_gate_2src(act->scratch2, x_in, ve, ve_gate_w,
+                        T, 6, H, D, D, 2.0f, ctx->stream);
+            // Save VE gate values for backward
+            if (is_training && ve_gate_idx >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(act->saved_ve_gate[ve_gate_idx], act->scratch2,
+                           T * H * sizeof(bf16), cudaMemcpyDeviceToDevice, ctx->stream));
+            }
             // scratch2 is [T, H], broadcast to [T, H, HD]: gate_idx = (idx/HD) % (T*H) = t*H+h
             fused_gate_add(V, V, act->scratch2, ve,
                           T * H * HD, HD, T * H, ctx->stream);
@@ -1397,14 +1412,18 @@ static void attention_forward(TrainingContext* ctx, int layer, int attn_idx,
 
         // VE gating for paired path
         if (ve != NULL && ve_gate_w != NULL) {
-            // gate = 2 * sigmoid(x[:12] @ ve_gate_w.T) -> [T, H/2]
-            // Then broadcast to [2T, H/2, 1] by repeating each value twice
+            // gate = 2 * sigmoid(x[:12] @ ve_gate_w.T) -> [T, H]
+            // Python: [B,T,H] then .view(B, 2T, H/2, 1) for paired V broadcast
+            // In flat memory [T, H] = [2T, H/2], matching paired V layout [T, H, HD] = [2T, H/2, HD]
             sigmoid_gate(act->scratch2, x_in, ve_gate_w,
-                        T, 12, H / 2, 2.0f, ctx->stream);
-            // Gate is [T, H/2], data is [T, H, HD] with paired heads
-            // gate_idx = (idx/HD) % (T*H/2): pairs of heads share same gate
+                        T, 12, H, D, 2.0f, ctx->stream);
+            if (is_training && ve_gate_idx >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(act->saved_ve_gate[ve_gate_idx], act->scratch2,
+                           T * H * sizeof(bf16), cudaMemcpyDeviceToDevice, ctx->stream));
+            }
+            // Gate is [T, H] = [2T, H/2], data is [T, H, HD] = [2T, H/2, HD]
             fused_gate_add(V, V, act->scratch2, ve,
-                          T * H * HD, HD, T * H / 2, ctx->stream);
+                          T * H * HD, HD, T * H, ctx->stream);
         }
     }
 
@@ -1460,7 +1479,7 @@ static void attention_forward(TrainingContext* ctx, int layer, int attn_idx,
     // sigmoid_gate computes gate values [T, H], then elementwise multiply with attn_out
     if (attn_gate_w != NULL) {
         sigmoid_gate(act->scratch2, x_in, attn_gate_w,
-                    T, 12, H, 1.0f, ctx->stream);
+                    T, 12, H, D, 1.0f, ctx->stream);
         // Save gate values for backward
         if (is_training && attn_idx >= 0) {
             CUDA_CHECK(cudaMemcpyAsync(act->saved_attn_gate[attn_idx], act->scratch2,
@@ -1523,7 +1542,22 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
                                 int32_t* cu_seqlens, int num_seqs,
                                 int num_tokens, int window_size,
                                 int max_seq_len, int is_paired,
-                                float attn_scale) {
+                                float attn_scale,
+                                bf16* yarn_cos, bf16* yarn_sin,
+                                const bf16* attn_gate_w,  // [H, 12] gate weights (NULL if no gate)
+                                bf16* g_attn_gate_w,      // [H, 12] gate gradient accumulator
+                                float* gate_grad_scratch,  // [T*H] scratch for gate sigmoid grad
+                                // VE backward parameters (all NULL/0 if no VE for this layer)
+                                const bf16* ve_gate_w,     // [H, 12] VE gate weights
+                                bf16* g_ve_gate_w,         // VE gate weight gradient accumulator
+                                bf16* g_value_embeds,      // [VOCAB_SIZE, D] VE gradient (for scatter-add)
+                                const int32_t* inputs,     // [T] input token IDs (for VE gather/scatter)
+                                int ve_gate_idx,           // index into saved_ve_gate (-1 if no VE)
+                                int ve_idx,                // which value_embed table
+                                const bf16* value_embeds,  // full value_embeds pointer
+                                int layer_idx,             // layer index for sa_lambda scalar grad
+                                float* scalar_grad_acc)    // scalar gradient accumulators
+{
     Activations* act = &ctx->act;
     int T = num_tokens;
     int D = MODEL_DIM;
@@ -1550,7 +1584,23 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
     // grad_gated = grad_out @ out_w * sa_lambda1
     bf16* grad_gated = act->attn_out;  // reuse as scratch [T, D]
     gemm_bf16(ctx->cublas_handle, grad_out, out_w, grad_gated, T, D, D);
+
+    // sa_lambda1 scalar gradient: dot(unscaled_grad_gated, gated_out)
+    bf16_dot_product(scalar_grad_acc + 89 + 2 * layer_idx + 1,
+                     grad_gated, gated_out, T * D, ctx->stream);
+
     scale_tensor(grad_gated, sa_lambda1, T * D, ctx->stream);
+
+    // Step 2b: Gate weight gradient (before masking grad_gated by gate)
+    // grad_gate = sum(grad_gated * saved_attn_out, HD_dim) * sig * (1-sig)
+    if (attn_gate_w != NULL) {
+        gate_sigmoid_grad(gate_grad_scratch, grad_gated,
+                          act->saved_attn_out[attn_idx],
+                          act->saved_attn_gate[attn_idx],
+                          T, H, HD, 1.0f, ctx->stream);
+        gate_weight_grad(g_attn_gate_w, gate_grad_scratch,
+                         saved_normed, T, H, D, 12, ctx->stream);
+    }
 
     // Step 3: Gate backward - multiply gradient by gate values
     // grad_raw_attn = grad_gated * gate (broadcast gate [T,H] over HD)
@@ -1592,10 +1642,73 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
         ragged_offsets, act->seq_len_scratch,
         bucketed, attn_H, s_max, HD);
 
-    // Step 4: Backward through QK RMS norm and RoPE (skip for now — these are
-    // element-wise per position and the gradient is approximately pass-through
-    // since RMS norm has ~unit gain and RoPE is orthogonal)
-    // grad_qkv ≈ [dQ, dK, dV] concatenated as [T, 3D]
+    // Step 3b: VE gate backward (value embeddings gating: V += gate * ve)
+    // Step 3b: VE gate backward (value embeddings gating: V += gate * ve)
+    // dV from cuDNN is gradient w.r.t. modified V. Propagate through VE gating.
+    // Uses gate_grad_scratch[T*H..] to avoid conflict with attn gate grad at [0..T*H-1]
+    if (ve_gate_idx >= 0 && ve_gate_w != NULL) {
+        float* ve_gate_grad = gate_grad_scratch + T * H;
+
+        // Re-gather VE data into scratch (act->mlp_pre is free after step 1)
+        bf16* scratch_ve = act->mlp_pre;  // [T, D]
+        gather_embed(scratch_ve, value_embeds + (size_t)ve_idx * VOCAB_SIZE * D,
+                     inputs, T, D, ctx->stream);
+
+        // VE gate sigmoid grad: d_z = sum(dV * ve, HD_dim) * scale * sig * (1-sig)
+        // For both paired and non-paired: gate is [T, H], dV and ve are [T, H, HD]
+        gate_sigmoid_grad(ve_gate_grad, dV, scratch_ve,
+                          act->saved_ve_gate[ve_gate_idx],
+                          T, H, HD, 2.0f, ctx->stream);
+
+        if (!is_paired) {
+            // Non-paired: gate input is cat(x[:6], ve[:6]), weight is [H, 12]
+            gate_weight_grad_2src(g_ve_gate_w, ve_gate_grad,
+                                  saved_normed, scratch_ve,
+                                  T, H, D, D, 6, ctx->stream);
+        } else {
+            // Paired: gate input is x[:12] only, weight is [H, 12]
+            gate_weight_grad(g_ve_gate_w, ve_gate_grad,
+                             saved_normed, T, H, D, 12, ctx->stream);
+        }
+
+        // d_ve = gate * dV (gradient flowing to value embeddings through multiplication)
+        // Use act->mlp_post as scratch for d_ve [T, D]
+        bf16* d_ve = act->mlp_post;
+        elementwise_mul_broadcast(d_ve, dV, act->saved_ve_gate[ve_gate_idx],
+                                  T * H * HD, HD, T * H, ctx->stream);
+
+        // Scatter-add d_ve to g_value_embeds
+        scatter_add_embed(g_value_embeds + (size_t)ve_idx * VOCAB_SIZE * D,
+                          d_ve, inputs, T, D, ctx->stream);
+    }
+
+    // Step 4: Backward through RoPE (apply transpose of rotation matrix)
+    // dQ and dK are in attention layout:
+    //   non-paired: [T, H, HD]
+    //   paired: [2T, H/2, HD] = [T, H/2, 2*HD] in memory (same layout)
+    if (!is_paired) {
+        rope_backward(dQ, dQ, yarn_cos, yarn_sin, T, H, HD, ctx->stream);
+        rope_backward(dK, dK, yarn_cos, yarn_sin, T, H, HD, ctx->stream);
+    } else {
+        // Paired: data is [T, H/2, 2*HD] — same memory as [2T, H/2, HD]
+        rope_backward(dQ, dQ, yarn_cos, yarn_sin, T, H / 2, 2 * HD, ctx->stream);
+        rope_backward(dK, dK, yarn_cos, yarn_sin, T, H / 2, 2 * HD, ctx->stream);
+    }
+
+    // Step 5: Backward through QK RMS normalization
+    // Need pre-norm Q,K — recompute by re-doing QKV projection
+    // qkv_raw = saved_normed @ (sa_lambda0 * qkvo_w[:3D]).T
+    gemm_bf16_Bt(ctx->cublas_handle, saved_normed, qkvo_w, act->qkv,
+                 T, 3 * D, D, sa_lambda0);
+    // act->qkv now has pre-norm Q and K (and V which doesn't need norm backward)
+    bf16* Q_pre = act->qkv;                  // [T, H, HD] pre-norm
+    bf16* K_pre = act->qkv + T * H * HD;     // [T, H, HD] pre-norm
+
+    // rms_norm_bwd: dQ_raw = rms_norm_bwd(dQ_post_rope, Q_pre)
+    rms_norm_bwd(dQ, dQ, Q_pre, T * H, HD, ctx->stream);
+    rms_norm_bwd(dK, dK, K_pre, T * H, HD, ctx->stream);
+
+    // dV passes through unchanged (no norm/RoPE on V)
 
     // Concatenate dQ, dK, dV back into qkv layout [T, 3*H*HD]
     CUDA_CHECK(cudaMemcpyAsync(act->qkv, dQ, T * H * HD * sizeof(bf16),
@@ -1605,7 +1718,7 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
     CUDA_CHECK(cudaMemcpyAsync(act->qkv + 2 * T * H * HD, dV, T * H * HD * sizeof(bf16),
                cudaMemcpyDeviceToDevice, ctx->stream));
 
-    // Step 5: QKV projection backward
+    // Step 6: QKV projection backward
     // Forward: qkv = x_normed @ (sa_lambda0 * qkvo_w[:3D]).T
     // grad_qkvo[:3D] += sa_lambda0 * grad_qkv.T @ x_normed  (= [3D,T] @ [T,D] = [3D,D])
     gemm_bf16_At(ctx->cublas_handle, act->qkv, saved_normed, g_attn_bank,
@@ -1614,7 +1727,35 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
     // grad_normed = grad_qkv @ qkvo_w[:3D] * sa_lambda0
     gemm_bf16(ctx->cublas_handle, act->qkv, qkvo_w, grad_normed,
               T, D, 3 * D);
+
+    // sa_lambda0 scalar gradient: dot(unscaled_grad_normed, saved_normed)
+    bf16_dot_product(scalar_grad_acc + 89 + 2 * layer_idx,
+                     grad_normed, saved_normed, T * D, ctx->stream);
+
     scale_tensor(grad_normed, sa_lambda0, T * D, ctx->stream);
+
+    // Step 7: Gate input gradient — add gate's contribution to grad_normed[:, :12]
+    // attn_gate_grad is at gate_grad_scratch[0..T*H-1] (set in step 2b)
+    if (attn_gate_w != NULL) {
+        gate_input_grad(grad_normed, gate_grad_scratch, attn_gate_w,
+                        T, H, D, 12, ctx->stream);
+    }
+
+    // Step 7b: VE gate input gradient (deferred from step 3b)
+    // ve_gate_grad is at gate_grad_scratch[T*H..] (set in step 3b)
+    if (ve_gate_idx >= 0 && ve_gate_w != NULL) {
+        float* ve_gate_grad = gate_grad_scratch + T * H;
+        if (!is_paired) {
+            // Non-paired: gate input was cat(x[:6], ve[:6])
+            // Add grad to grad_normed[:,:6] and a throwaway buffer for ve[:,:6]
+            gate_input_grad_2src(grad_normed, act->mlp_pre, ve_gate_grad,
+                                  ve_gate_w, T, H, D, D, 6, ctx->stream);
+        } else {
+            // Paired: gate input was x[:12] only
+            gate_input_grad(grad_normed, ve_gate_grad, ve_gate_w,
+                            T, H, D, 12, ctx->stream);
+        }
+    }
 }
 
 void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
@@ -1710,7 +1851,7 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
             // Then scale by sigmoid(skip_lambda_raw) * 2
             float skip_scale = 2.0f / (1.0f + expf(-skip_lambda_raw));
             sigmoid_gate(act->scratch2, act->x0, p->skip_gate,
-                        T, 12, 1, skip_scale, ctx->stream);
+                        T, 12, 1, D, skip_scale, ctx->stream);
             // lane0 += skip_gate_out * skip_save (gate [T,1], data [T,D])
             // gate_idx = (idx/D) % T = t
             fused_gate_add(act->lane0, act->lane0, act->scratch2, act->skip_save,
@@ -1764,7 +1905,7 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
             attention_forward(ctx, i, attn_bank_idx, act->normed, act->scratch1,
                             qkvo_w, sa_lambda0, sa_lambda1,
-                            attn_gw, ve_gw, ve_ptr,
+                            attn_gw, ve_gw, ve_ptr, ve_gate_map[i],
                             cum_seqlens, num_seqs, T, train_max_seq_len,
                             bm_sizes[i], is_paired_layer[i], key_offsets[i],
                             y_cos, y_sin, attn_scale_val, is_training);
@@ -1794,7 +1935,7 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
             attention_forward(ctx, i, attn_bank_idx, act->normed, act->scratch1,
                             qkvo_w, sa_lambda0, sa_lambda1,
-                            attn_gw, ve_gw, ve_ptr,
+                            attn_gw, ve_gw, ve_ptr, ve_gate_map[i],
                             cum_seqlens, num_seqs, T, train_max_seq_len,
                             bm_sizes[i], is_paired_layer[i], key_offsets[i],
                             y_cos, y_sin, attn_scale_val, is_training);
@@ -1930,8 +2071,9 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     BWD_TIMER_START();
 
     // 1. Softcapped CE backward -> BF16 gradients
-    // Scale by 1/(T * GRAD_ACCUM_STEPS) since we normalize loss by T
-    fill_constant_f32(act->scratch_f32, 1.0f / (T * GRAD_ACCUM_STEPS), T, ctx->stream);
+    // Scale by 1/GRAD_ACCUM_STEPS to match Python: loss = losses.sum() * grad_scale
+    // where grad_scale = 1/grad_accum_steps. Each token's upstream gradient = grad_scale.
+    fill_constant_f32(act->scratch_f32, 1.0f / GRAD_ACCUM_STEPS, T, ctx->stream);
     CUDA_CHECK(cudaMemcpyAsync(act->scratch_f32 + T, mtp_weights, n_mtp * sizeof(float),
                                 cudaMemcpyHostToDevice, ctx->stream));
 
@@ -1957,8 +2099,20 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     gemm_bf16_At(ctx->cublas_handle, act->x, grad_logits_bf16, g->lm_head,
                  D, VOCAB_SIZE, T, 1.0f, 1.0f);  // beta=1: accumulate
 
+    // Read scalars early (needed for pre-norm recomputation in step 3)
+    const bf16* h_scalars = cs->scalars;
+    float backout_lambda = __bfloat162float(h_scalars[2 * NUM_LAYERS + 1]);
+
     // 3. Final RMS norm backward
-    rms_norm_bwd(act->grad_x, act->grad_x, act->x, T, D, ctx->stream);
+    // act->x was overwritten by in-place rms_norm_fwd in the forward pass.
+    // Recompute the pre-norm value: pre_norm = 0.5*(lane0+lane1) - backout_lambda*x_backout
+    // lane0/lane1 still contain final forward values (backward uses grad_lane0/grad_lane1).
+    {
+        bf16* pre_norm_final = act->scratch1;
+        fused_add_scale(pre_norm_final, act->lane0, act->lane1, 0.5f, 0.5f, T * D, ctx->stream);
+        fused_add_scale(pre_norm_final, pre_norm_final, act->x_backout, 1.0f, -backout_lambda, T * D, ctx->stream);
+        rms_norm_bwd(act->grad_x, act->grad_x, pre_norm_final, T, D, ctx->stream);
+    }
 
     // 4. Backout/lane-merge backward
     // Forward: x = 0.5*(lane0+lane1) - backout_lambda*x_backout
@@ -1969,7 +2123,6 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     scale_tensor(act->grad_lane0, 0.5f, T * D, ctx->stream);
     scale_tensor(act->grad_lane1, 0.5f, T * D, ctx->stream);
 
-    // Read scalars and lambdas (same as forward)
     // Per-layer window sizes and attention scale (mirrors forward_pass setup)
     int bm_sizes[NUM_LAYERS] = {ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, 0,
                                  ws_short, ws_short, ws_short, ws_long};
@@ -1978,9 +2131,13 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     for (int j = 0; j < 4; j++) is_paired_layer[paired_layers_bk[j]] = 1;
     float attn_scale_val = g_yarn.attn_scale;
 
-    // Use cached scalars (no D2H copies needed)
-    const bf16* h_scalars = cs->scalars;
-    float backout_lambda = __bfloat162float(h_scalars[2 * NUM_LAYERS + 1]);
+    // Gate mappings (same as forward)
+    int attn_gate_map[NUM_LAYERS] = {0, 1, 2, 3, 4, 5, -1, 6, 7, 8, 9};
+    int ve_gate_map[NUM_LAYERS] = {-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, 4};
+
+    // Float scratch for gate sigmoid gradient [T*H floats]
+    // Located past scalar_grad_acc in scratch_f32
+    float* gate_grad_scratch = act->scratch_f32 + T + 256;
 
     const bf16* h_resid = cs->resid_lambdas;
     const bf16* h_post_lambdas = cs->post_lambdas;
@@ -2007,9 +2164,11 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     //   [33..43] bigram_lambda gradients (per layer)
     //   [44..87] post_lambda gradients (per layer * 4)
     //   [88]     backout_lambda gradient
-    //   Total: 89 floats
+    //   [89..110] sa_lambda gradients (per layer * 2: [89+2*i]=sa_lambda0, [89+2*i+1]=sa_lambda1)
+    //   [111]    skip_lambda raw dot product (multiplied by (1-σ(sl)) in accumulation)
+    //   Total: 112 floats
     float* scalar_grad_acc = act->scratch_f32 + T;  // safe: scratch_f32 is T*D floats
-    CUDA_CHECK(cudaMemsetAsync(scalar_grad_acc, 0, 89 * sizeof(float), ctx->stream));
+    CUDA_CHECK(cudaMemsetAsync(scalar_grad_acc, 0, 112 * sizeof(float), ctx->stream));
 
     // backout_lambda gradient: forward was x -= backout_lambda * x_backout
     // grad_backout_lambda = -dot(grad_x, x_backout)
@@ -2038,13 +2197,6 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
             // grad_lane0 -= backout_lambda * grad_x (from the lane merge)
             fused_add_scale(act->grad_lane0, act->grad_lane0, act->grad_x,
                            1.0f, -backout_lambda, T * D, ctx->stream);
-        }
-
-        // Skip connection backward at SKIP_IN_LAYER (layer 3):
-        // grad_lane0 += grad_skip_save (stored in skip_save during layer 6 backward)
-        if (i == SKIP_IN_LAYER) {
-            fused_add_scale(act->grad_lane0, act->grad_lane0, act->skip_save,
-                           1.0f, 1.0f, T * D, ctx->stream);
         }
 
         // Weight pointers
@@ -2100,14 +2252,34 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
             // Skip connection backward at layer 6 (after MLP backward, since skip injection
             // happens before MLP in forward). Now grad_lane0 = gradient w.r.t. lane0 after skip.
             // Forward: lane0 += skip_gate_out * skip_save
-            // Backward: grad_skip_save = skip_gate_out * grad_lane0 (for layer 3)
-            //           grad_lane0 unchanged (addition passes gradient through)
+            //   where skip_gate_out = 2*σ(sl)*σ(skip_gate@x0[:,:12])
+            // Backward: grad for skip_gate weight, skip_lambda, and skip_save
             {
                 float skip_lambda_raw = __bfloat162float(h_scalars[2 * NUM_LAYERS + 2]);
-                float skip_scale = 2.0f / (1.0f + expf(-skip_lambda_raw));
+                float sl_sig = 1.0f / (1.0f + expf(-skip_lambda_raw));
+                float skip_scale = 2.0f * sl_sig;
                 sigmoid_gate(act->scratch2, act->x0, p->skip_gate,
-                            T, 12, 1, skip_scale, ctx->stream);
-                // grad_skip_save = gate * grad_lane0 (gate is [T,1], broadcast over D)
+                            T, 12, 1, D, skip_scale, ctx->stream);
+
+                // Skip gate weight gradient: d(loss)/d(skip_gate) via sigmoid backward
+                // gate_sigmoid_grad: for each t, computes dot(grad_lane0[t,:], skip_save[t,:]) * scale * σ(z)*(1-σ(z))
+                gate_sigmoid_grad(gate_grad_scratch, act->grad_lane0, act->skip_save,
+                                  act->scratch2, T, 1, D, skip_scale, ctx->stream);
+                gate_weight_grad(g->skip_gate, gate_grad_scratch,
+                                 act->x0, T, 1, D, 12, ctx->stream);
+
+                // Skip gate input gradient: grad_x0[:,:12] += gate_grad * skip_gate_weight
+                gate_input_grad(grad_x0, gate_grad_scratch, p->skip_gate,
+                                T, 1, D, 12, ctx->stream);
+
+                // Skip lambda gradient: (1-σ(sl)) * Σ_t gate_full[t] * Σ_d grad_lane0[t,d] * skip_save[t,d]
+                // Compute temp = grad_lane0 * gate_broadcast, then dot(temp, skip_save)
+                elementwise_mul_broadcast(act->mlp_pre, act->grad_lane0, act->scratch2,
+                                          T * D, D, T, ctx->stream);
+                bf16_dot_product(scalar_grad_acc + 111, act->mlp_pre, act->skip_save,
+                                 T * D, ctx->stream);
+
+                // grad_skip_save = gate * grad_lane0 (for layer 3)
                 elementwise_mul_broadcast(act->skip_save, act->grad_lane0, act->scratch2,
                                           T * D, D, T, ctx->stream);
             }
@@ -2156,6 +2328,13 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
             // grad_lane0 = resid_mlp * grad_lane0 + grad_normed (from MLP path)
             fused_add_scale(act->grad_lane0, act->grad_lane0, grad_normed, resid_mlp, 1.0f, T * D, ctx->stream);
 
+            // Skip connection backward at SKIP_IN_LAYER (layer 3):
+            // Add grad_skip_save AFTER MLP backward, since skip_save = post_attn (before MLP)
+            if (i == SKIP_IN_LAYER) {
+                fused_add_scale(act->grad_lane0, act->grad_lane0, act->skip_save,
+                               1.0f, 1.0f, T * D, ctx->stream);
+            }
+
             // x0_inject backward: grad_x0 += x0_lambda * grad_lane0, grad_x0_bigram += bigram_lambda * grad_lane0
             // Also compute scalar gradients for x0_lambda, bigram_lambda, resid_attn
             bf16_dot_product(scalar_grad_acc + 22 + i, act->grad_lane0, act->x0, T * D, ctx->stream);  // x0_lambda
@@ -2181,11 +2360,33 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 bf16* g_attn = g->attn_bank + attn_bank_idx * 4 * D * D;
 
                 bf16* grad_normed_attn = act->scratch2;
+                bf16* y_cos = is_paired_layer[i] ? act->yarn_paired_cos : act->yarn_cos;
+                bf16* y_sin = is_paired_layer[i] ? act->yarn_paired_sin : act->yarn_sin;
+
+                // Gate pointers for this layer
+                const bf16* attn_gw = (attn_gate_map[i] >= 0) ?
+                    p->attn_gate_bank + attn_gate_map[i] * NUM_HEADS * 12 : NULL;
+                bf16* g_attn_gw = (attn_gate_map[i] >= 0) ?
+                    g->attn_gate_bank + attn_gate_map[i] * NUM_HEADS * 12 : NULL;
+
+                // VE pointers for this layer
+                const bf16* ve_gw = (ve_gate_map[i] >= 0) ?
+                    p->ve_gate_bank + ve_gate_map[i] * NUM_HEADS * 12 : NULL;
+                bf16* g_ve_gw = (ve_gate_map[i] >= 0) ?
+                    g->ve_gate_bank + ve_gate_map[i] * NUM_HEADS * 12 : NULL;
+
                 attention_backward(ctx, attn_bank_idx, act->grad_lane0, grad_normed_attn,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
                                   T, bm_sizes[i], train_max_seq_len,
-                                  is_paired_layer[i], attn_scale_val);
+                                  is_paired_layer[i], attn_scale_val,
+                                  y_cos, y_sin,
+                                  attn_gw, g_attn_gw, gate_grad_scratch,
+                                  ve_gw, g_ve_gw, g->value_embeds,
+                                  inputs, ve_gate_map[i],
+                                  (ve_gate_map[i] >= 0) ? ve_gate_map[i] : 0,
+                                  p->value_embeds,
+                                  i, scalar_grad_acc);
 
                 // RMS norm backward for attention input
                 rms_norm_bwd(grad_normed_attn, grad_normed_attn, act->saved_lane0[i], T, D, ctx->stream);
@@ -2273,11 +2474,33 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 bf16* g_attn = g->attn_bank + attn_bank_idx * 4 * D * D;
 
                 bf16* grad_normed_attn = act->scratch1;
+                bf16* y_cos = is_paired_layer[i] ? act->yarn_paired_cos : act->yarn_cos;
+                bf16* y_sin = is_paired_layer[i] ? act->yarn_paired_sin : act->yarn_sin;
+
+                // Gate pointers for this layer
+                const bf16* attn_gw = (attn_gate_map[i] >= 0) ?
+                    p->attn_gate_bank + attn_gate_map[i] * NUM_HEADS * 12 : NULL;
+                bf16* g_attn_gw = (attn_gate_map[i] >= 0) ?
+                    g->attn_gate_bank + attn_gate_map[i] * NUM_HEADS * 12 : NULL;
+
+                // VE pointers for this layer
+                const bf16* ve_gw = (ve_gate_map[i] >= 0) ?
+                    p->ve_gate_bank + ve_gate_map[i] * NUM_HEADS * 12 : NULL;
+                bf16* g_ve_gw = (ve_gate_map[i] >= 0) ?
+                    g->ve_gate_bank + ve_gate_map[i] * NUM_HEADS * 12 : NULL;
+
                 attention_backward(ctx, attn_bank_idx, grad_attn, grad_normed_attn,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
                                   T, bm_sizes[i], train_max_seq_len,
-                                  is_paired_layer[i], attn_scale_val);
+                                  is_paired_layer[i], attn_scale_val,
+                                  y_cos, y_sin,
+                                  attn_gw, g_attn_gw, gate_grad_scratch,
+                                  ve_gw, g_ve_gw, g->value_embeds,
+                                  inputs, ve_gate_map[i],
+                                  (ve_gate_map[i] >= 0) ? ve_gate_map[i] : 0,
+                                  p->value_embeds,
+                                  i, scalar_grad_acc);
 
                 // RMS norm backward for attention input (lane0)
                 rms_norm_bwd(grad_normed_attn, grad_normed_attn, act->saved_lane0[i], T, D, ctx->stream);
@@ -2298,9 +2521,27 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     BWD_TIMER_END(g_bwd_layers_ms);
     BWD_TIMER_START();
 
+    // 5b. Initial lane0 backward: lane0 = x0 + bigram_lambda0 * x0_bigram
+    // grad_lane0 holds gradient flowing to the initial lane0 — must be added
+    // to grad_x0 and grad_x0_bigram before embedding backward
+    {
+        float bigram_lambda0 = __bfloat162float(cs->bigram_lambdas[0]);
+        fused_add_scale(grad_x0, grad_x0, act->grad_lane0, 1.0f, 1.0f, T * D, ctx->stream);
+        fused_add_scale(grad_x0_bigram, grad_x0_bigram, act->grad_lane0, 1.0f, bigram_lambda0, T * D, ctx->stream);
+        // bigram_lambda[0] scalar gradient (skipped in loop since i > 0 guard)
+        bf16_dot_product(scalar_grad_acc + 33, act->grad_lane0, act->x0_bigram, T * D, ctx->stream);
+    }
+
     // 6. Embedding backward
-    // grad through x0 -> rms_norm backward -> grad_x
-    rms_norm_bwd(grad_x0, grad_x0, act->x, T, D, ctx->stream);
+    // Recompute smeared embeddings for correct rms_norm_bwd input.
+    // Forward was: gather_embed -> smear_forward -> rms_norm_fwd -> x0
+    {
+        float smear_lambda = __bfloat162float(cs->scalars[2 * NUM_LAYERS]);
+        bf16* smeared_embed = act->scratch1;
+        gather_embed(smeared_embed, p->embed, inputs, T, D, ctx->stream);
+        smear_forward(smeared_embed, smeared_embed, p->smear_gate, smear_lambda, T, D, ctx->stream);
+        rms_norm_bwd(grad_x0, grad_x0, smeared_embed, T, D, ctx->stream);
+    }
 
     // scatter-add into embed gradient
     scatter_add_embed(g->embed, grad_x0, inputs, T, D, ctx->stream);
@@ -2313,10 +2554,15 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
     // 7. Accumulate scalar gradient accumulators into gradient buffers (GPU-side)
     // scalar_grad_acc layout: [0..10] resid_attn, [11..21] resid_mlp,
-    //   [22..32] x0_lambda, [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
+    //   [22..32] x0_lambda, [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda,
+    //   [89..110] sa_lambda (2 per layer), [111] skip_lambda raw dot
+    float skip_lambda_raw = __bfloat162float(cs->scalars[2 * NUM_LAYERS + 2]);
+    float sl_sig = 1.0f / (1.0f + expf(-skip_lambda_raw));
+    float skip_lambda_factor = 1.0f - sl_sig;
     accumulate_scalar_grads(g->resid_lambdas, g->x0_lambdas, g->bigram_lambdas,
                             g->post_lambdas, g->scalars,
-                            scalar_grad_acc, NUM_LAYERS, ctx->stream);
+                            scalar_grad_acc, NUM_LAYERS,
+                            skip_lambda_factor, ctx->stream);
 
     BWD_TIMER_END(g_bwd_scalgrad_ms);
     #undef BWD_TIMER_START
@@ -2391,10 +2637,11 @@ static void polar_express(TrainingContext* ctx,
     nesterov_momentum(grad_chunk, momentum_buffer, grad_chunk, momentum,
                       batch * rows * cols, ctx->stream);
 
-    // 2. Normalize spectral norm: X /= (norm * 1.001 + eps)
+    // 2. Normalize spectral norm: X /= (norm * 1.02 + eps)
+    // Coefficients are computed for safety_factor=2e-2, must match
     float* norms = ctx->opt.polar_norms;
     tensor_norm(grad_chunk, norms, batch, rows, cols, ctx->stream);
-    norm_divide(grad_chunk, norms, batch, rows * cols, 0.001f, 1e-7f, ctx->stream);
+    norm_divide(grad_chunk, norms, batch, rows * cols, 2e-2f, 1e-6f, ctx->stream);
 
     // 3. Polar Express iterations (using pre-allocated scratch)
     bf16* A = ctx->opt.polar_A;
@@ -2459,6 +2706,9 @@ static void polar_express(TrainingContext* ctx,
     }
 }
 
+// Forward declaration (defined in Section H)
+static float get_lr(int step);
+
 void optimizer_step(TrainingContext* ctx, int step, int do_adam) {
     ModelParams* p = &ctx->params;
     ModelGrads* g = &ctx->grads;
@@ -2466,17 +2716,8 @@ void optimizer_step(TrainingContext* ctx, int step, int do_adam) {
     cudaStream_t stream = ctx->stream;
 
     // Get schedule parameters
-    float step_lr = 1.0f;  // Will be computed from schedule
+    float step_lr = get_lr(step);  // Stage LR multiplier + cooldown
     float muon_momentum = MUON_MOMENTUM;
-
-    // Compute learning rate from schedule
-    // (Simplified - full schedule lookup needed)
-    // stage_lr * cooldown
-    int cd_start = (int)(NUM_SCHEDULED_ITERS * (1.0f - COOLDOWN_FRAC));
-    if (step >= cd_start && step < NUM_SCHEDULED_ITERS) {
-        float t = fminf(1.0f, (float)(step - cd_start) / (NUM_SCHEDULED_ITERS - cd_start));
-        step_lr = step_lr * (1.0f - t) + 0.15f * t;
-    }
 
     // Muon momentum warmup/cooldown
     int muon_warmup = 300;
@@ -2691,7 +2932,7 @@ void optimizer_step(TrainingContext* ctx, int step, int do_adam) {
         // Shape multiplier: max(1, rows/cols)^0.5 * 1.0 for attn
         float shape_mult = 1.0f;  // 768/768 = 1, so no scaling
         float final_lr = shape_mult * eff_lr;
-        float eff_wd = MUON_WD * MUON_LR;
+        float eff_wd = MUON_WD * MUON_LR * step_lr;
 
         // Reshape grad to [40, 768, 768]
         bf16* grad = g->attn_bank;  // already in correct shape
@@ -2718,7 +2959,7 @@ void optimizer_step(TrainingContext* ctx, int step, int do_adam) {
         NorMuonState* s = &opt->muon_mlp_bank;
         float eff_lr_base = MUON_LR * step_lr;
         float shape_mult = sqrtf(fmaxf(1.0f, (float)MLP_HDIM / MODEL_DIM));  // sqrt(4) = 2
-        float eff_wd = MUON_WD * MUON_LR;
+        float eff_wd = MUON_WD * MUON_LR * step_lr;
 
         bf16* grad = g->mlp_bank;
         int batch = 24;
@@ -3078,7 +3319,14 @@ int main(int argc, char** argv) {
         int n_mtp;
         get_mtp_weights(step, mtp_weights, &n_mtp);
 
-        zero_grads(&ctx.grads, ctx.stream);
+        // NorMuon grads always zeroed (attn_bank, mlp_bank update every step)
+        // Adam grads only zeroed on even steps — on odd steps they accumulate
+        // with the previous even step's grads (Python clears Adam grads only
+        // after odd-step optimizer updates)
+        zero_normuon_grads(&ctx.grads, ctx.stream);
+        if (step % 2 == 0) {
+            zero_adam_grads(&ctx.grads, ctx.stream);
+        }
 
         // Cache all scalar parameters from GPU once per step (constant across microsteps)
         CachedScalars cached_scalars;
@@ -3108,11 +3356,10 @@ int main(int argc, char** argv) {
                 &train_num_seqs);
 
             if (got < 0) {
-                // Load next shard
+                // Load next shard (wrap around if all exhausted)
                 current_shard++;
                 if (current_shard >= (int)train_glob.gl_pathc) {
-                    fprintf(stderr, "Ran out of training shards!\n");
-                    break;
+                    current_shard = 0;  // wrap around to first shard
                 }
                 unload_data_shard(&train_shard);
                 train_shard = load_data_shard(train_glob.gl_pathv[current_shard]);
