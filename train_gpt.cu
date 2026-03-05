@@ -1542,6 +1542,7 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
                                 int32_t* cu_seqlens, int num_seqs,
                                 int num_tokens, int window_size,
                                 int max_seq_len, int is_paired,
+                                int key_offset_flag,
                                 float attn_scale,
                                 bf16* yarn_cos, bf16* yarn_sin,
                                 const bf16* attn_gate_w,  // [H, 12] gate weights (NULL if no gate)
@@ -1682,6 +1683,15 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
                           d_ve, inputs, T, D, ctx->stream);
     }
 
+    // Step 3c: Key offset shift backward (reverse the forward shift on dK)
+    if (key_offset_flag && !is_paired && T > 1) {
+        // Copy dK to scratch1 as source (avoids race condition in parallel backward)
+        CUDA_CHECK(cudaMemcpyAsync(act->scratch1, dK, (size_t)T * H * HD * sizeof(bf16),
+                   cudaMemcpyDeviceToDevice, ctx->stream));
+        key_offset_shift_backward(dK, act->scratch1, cu_seqlens, num_seqs,
+                                   T, H, HD, ctx->stream);
+    }
+
     // Step 4: Backward through RoPE (apply transpose of rotation matrix)
     // dQ and dK are in attention layout:
     //   non-paired: [T, H, HD]
@@ -1770,15 +1780,15 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     int D = MODEL_DIM;
 
     // ---- Embeddings ----
-    // x = embed(input_seq)
-    gather_embed(act->x, p->embed, inputs, T, D, ctx->stream);
+    // x = embed(input_seq) -> raw embed into scratch2, then smear into x
+    gather_embed(act->scratch2, p->embed, inputs, T, D, ctx->stream);
 
     // x0_bigram = bigram_embed(bigram_inputs)
     gather_embed(act->x0_bigram, p->bigram_embed, bigram_inputs, T, D, ctx->stream);
 
-    // Smear token embedding forward 1 position
+    // Smear token embedding forward 1 position (separate buffers to avoid race)
     float smear_lambda = __bfloat162float(cs->scalars[2 * NUM_LAYERS]);
-    smear_forward(act->x, act->x, p->smear_gate, smear_lambda, T, D, ctx->stream);
+    smear_forward(act->x, act->scratch2, p->smear_gate, smear_lambda, T, D, ctx->stream);
 
     // x0 = norm(x) -- per-token RMS normalization
     rms_norm_fwd(act->x0, act->x, T, D, ctx->stream);
@@ -2126,6 +2136,8 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     // Per-layer window sizes and attention scale (mirrors forward_pass setup)
     int bm_sizes[NUM_LAYERS] = {ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, 0,
                                  ws_short, ws_short, ws_short, ws_long};
+    int key_offsets[NUM_LAYERS];
+    for (int i = 0; i < NUM_LAYERS; i++) key_offsets[i] = (bm_sizes[i] == ws_long) ? 1 : 0;
     int paired_layers_bk[] = {0, 2, 5, 9};
     int is_paired_layer[NUM_LAYERS] = {};
     for (int j = 0; j < 4; j++) is_paired_layer[paired_layers_bk[j]] = 1;
@@ -2166,9 +2178,11 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     //   [88]     backout_lambda gradient
     //   [89..110] sa_lambda gradients (per layer * 2: [89+2*i]=sa_lambda0, [89+2*i+1]=sa_lambda1)
     //   [111]    skip_lambda raw dot product (multiplied by (1-σ(sl)) in accumulation)
-    //   Total: 112 floats
+    //   [112]    smear_lambda gradient
+    //   [113..124] smear_gate_w gradients
+    //   Total: 125 floats
     float* scalar_grad_acc = act->scratch_f32 + T;  // safe: scratch_f32 is T*D floats
-    CUDA_CHECK(cudaMemsetAsync(scalar_grad_acc, 0, 112 * sizeof(float), ctx->stream));
+    CUDA_CHECK(cudaMemsetAsync(scalar_grad_acc, 0, 125 * sizeof(float), ctx->stream));
 
     // backout_lambda gradient: forward was x -= backout_lambda * x_backout
     // grad_backout_lambda = -dot(grad_x, x_backout)
@@ -2379,7 +2393,8 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
                                   T, bm_sizes[i], train_max_seq_len,
-                                  is_paired_layer[i], attn_scale_val,
+                                  is_paired_layer[i], key_offsets[i],
+                                  attn_scale_val,
                                   y_cos, y_sin,
                                   attn_gw, g_attn_gw, gate_grad_scratch,
                                   ve_gw, g_ve_gw, g->value_embeds,
@@ -2493,7 +2508,8 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
                                   T, bm_sizes[i], train_max_seq_len,
-                                  is_paired_layer[i], attn_scale_val,
+                                  is_paired_layer[i], key_offsets[i],
+                                  attn_scale_val,
                                   y_cos, y_sin,
                                   attn_gw, g_attn_gw, gate_grad_scratch,
                                   ve_gw, g_ve_gw, g->value_embeds,
@@ -2533,18 +2549,29 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     }
 
     // 6. Embedding backward
-    // Recompute smeared embeddings for correct rms_norm_bwd input.
     // Forward was: gather_embed -> smear_forward -> rms_norm_fwd -> x0
+    // Backward: rms_norm_bwd -> smear_backward -> scatter_add_embed
     {
         float smear_lambda = __bfloat162float(cs->scalars[2 * NUM_LAYERS]);
-        bf16* smeared_embed = act->scratch1;
-        gather_embed(smeared_embed, p->embed, inputs, T, D, ctx->stream);
-        smear_forward(smeared_embed, smeared_embed, p->smear_gate, smear_lambda, T, D, ctx->stream);
+        bf16* x_raw = act->scratch2;          // raw embeddings
+        bf16* smeared_embed = act->scratch1;   // smeared embeddings
+
+        // Recompute raw and smeared embeddings
+        gather_embed(x_raw, p->embed, inputs, T, D, ctx->stream);
+        smear_forward(smeared_embed, x_raw, p->smear_gate, smear_lambda, T, D, ctx->stream);
+
+        // rms_norm_bwd: grad_x0 becomes grad w.r.t. smeared embeddings
         rms_norm_bwd(grad_x0, grad_x0, smeared_embed, T, D, ctx->stream);
+
+        // smear_backward: grad_smeared -> grad_raw, accumulate scalar grads
+        // Writes grad_raw to scratch1 (separate from grad_x0 input)
+        smear_backward(smeared_embed, grad_x0, x_raw, p->smear_gate, smear_lambda,
+                       scalar_grad_acc + 112, scalar_grad_acc + 113,
+                       T, D, ctx->stream);
     }
 
-    // scatter-add into embed gradient
-    scatter_add_embed(g->embed, grad_x0, inputs, T, D, ctx->stream);
+    // scatter-add into embed gradient (from scratch1 which has grad_raw)
+    scatter_add_embed(g->embed, act->scratch1, inputs, T, D, ctx->stream);
 
     // scatter-add into bigram_embed gradient
     scatter_add_embed(g->bigram_embed, grad_x0_bigram, bigram_inputs, T, D, ctx->stream);
@@ -2559,8 +2586,9 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     float skip_lambda_raw = __bfloat162float(cs->scalars[2 * NUM_LAYERS + 2]);
     float sl_sig = 1.0f / (1.0f + expf(-skip_lambda_raw));
     float skip_lambda_factor = 1.0f - sl_sig;
+
     accumulate_scalar_grads(g->resid_lambdas, g->x0_lambdas, g->bigram_lambdas,
-                            g->post_lambdas, g->scalars,
+                            g->post_lambdas, g->scalars, g->smear_gate,
                             scalar_grad_acc, NUM_LAYERS,
                             skip_lambda_factor, ctx->stream);
 
@@ -3407,6 +3435,41 @@ int main(int argc, char** argv) {
 
         free(h_inputs);
         free(h_targets);
+
+        // Gradient norm diagnostics at step 0
+        if (step == 0) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            float* scratch = ctx.act.scratch_f32;
+            #define PNORM(name, ptr, n) fprintf(stderr, "  grad_norm %-20s = %.6f\n", name, bf16_l2_norm(ptr, n, scratch, ctx.stream))
+            fprintf(stderr, "=== Step 0 gradient norms (after 8 microsteps) ===\n");
+            PNORM("attn_bank", ctx.grads.attn_bank, NUM_ATTN_LAYERS * 4 * MODEL_DIM * MODEL_DIM);
+            PNORM("mlp_bank", ctx.grads.mlp_bank, MLP_BANK_SIZE * 2 * MLP_HDIM * MODEL_DIM);
+            PNORM("embed", ctx.grads.embed, VOCAB_SIZE * MODEL_DIM);
+            PNORM("lm_head", ctx.grads.lm_head, MODEL_DIM * VOCAB_SIZE);
+            PNORM("bigram_embed", ctx.grads.bigram_embed, BIGRAM_VOCAB_SIZE * MODEL_DIM);
+            PNORM("value_embeds", ctx.grads.value_embeds, 5 * VOCAB_SIZE * MODEL_DIM);
+            PNORM("attn_gate_bank", ctx.grads.attn_gate_bank, 10 * NUM_HEADS * 12);
+            PNORM("ve_gate_bank", ctx.grads.ve_gate_bank, 5 * NUM_HEADS * 12);
+            PNORM("smear_gate", ctx.grads.smear_gate, 12);
+            PNORM("skip_gate", ctx.grads.skip_gate, 12);
+            PNORM("scalars", ctx.grads.scalars, (NUM_LAYERS * 2 + 3 + 1));
+            PNORM("post_lambdas", ctx.grads.post_lambdas, NUM_LAYERS * 4);
+            PNORM("x0_lambdas", ctx.grads.x0_lambdas, NUM_LAYERS);
+            PNORM("bigram_lambdas", ctx.grads.bigram_lambdas, NUM_LAYERS);
+            PNORM("resid_lambdas", ctx.grads.resid_lambdas, NUM_LAYERS * 2);
+            #undef PNORM
+
+            // Also print parameter norms
+            #define PPNORM(name, ptr, n) fprintf(stderr, "  param_norm %-20s = %.6f\n", name, bf16_l2_norm(ptr, n, scratch, ctx.stream))
+            fprintf(stderr, "=== Step 0 parameter norms (before optimizer step) ===\n");
+            PPNORM("attn_bank", ctx.params.attn_bank, NUM_ATTN_LAYERS * 4 * MODEL_DIM * MODEL_DIM);
+            PPNORM("mlp_bank", ctx.params.mlp_bank, MLP_BANK_SIZE * 2 * MLP_HDIM * MODEL_DIM);
+            PPNORM("embed", ctx.params.embed, VOCAB_SIZE * MODEL_DIM);
+            PPNORM("lm_head", ctx.params.lm_head, MODEL_DIM * VOCAB_SIZE);
+            PPNORM("scalars", ctx.params.scalars, (NUM_LAYERS * 2 + 3 + 1));
+            #undef PPNORM
+            fprintf(stderr, "=== End diagnostics ===\n");
+        }
 
         // Optimizer step
         int do_adam = (step % 2 == 1);

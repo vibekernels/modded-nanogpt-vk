@@ -165,6 +165,12 @@ void smear_forward(bf16* out, const bf16* x, const bf16* smear_gate_w,
                    float smear_lambda, int num_tokens, int model_dim,
                    cudaStream_t stream);
 
+// Smear backward: grad_raw from grad_smeared + scalar grad accumulation
+void smear_backward(bf16* grad_raw, const bf16* grad_smeared, const bf16* x_raw,
+                    const bf16* gate_w, float smear_lambda,
+                    float* grad_smear_lambda, float* grad_gate_w,
+                    int num_tokens, int model_dim, cudaStream_t stream);
+
 // ============================================================================
 // Optimizer kernels
 // ============================================================================
@@ -231,6 +237,9 @@ void gpu_reduce_sum(float* out, const float* x, int n, cudaStream_t stream);
 // Fill float array with a constant value
 void fill_constant_f32(float* out, float val, int n, cudaStream_t stream);
 
+// BF16 L2 norm: returns sqrt(sum(x[i]^2)). Uses scratch for GPU reduction.
+float bf16_l2_norm(const bf16* x, int n, float* scratch, cudaStream_t stream);
+
 // Dot product of two bf16 tensors, result added to a float output: *out += sum(a[i]*b[i])
 // Uses block reduction; out must be pre-initialized (e.g., to 0)
 void bf16_dot_product(float* out, const bf16* a, const bf16* b, int n, cudaStream_t stream);
@@ -282,6 +291,13 @@ void naive_varlen_attention_backward(
 void key_offset_shift(bf16* k, const int32_t* cu_seqlens, int num_seqs,
                       int total_T, int H, int HD, cudaStream_t stream);
 
+// Key offset shift backward: reverse shift on gradient dK
+// Reads from dk_orig (copy), writes to dk (same buffer is safe if dk != dk_orig)
+void key_offset_shift_backward(bf16* dk, const bf16* dk_orig,
+                                const int32_t* cu_seqlens, int num_seqs,
+                                int total_T, int H, int HD,
+                                cudaStream_t stream);
+
 // ============================================================================
 // Gate backward kernels
 // ============================================================================
@@ -322,10 +338,9 @@ void gate_input_grad_2src(bf16* grad_x, bf16* grad_ve, const float* grad_sigmoid
 // ============================================================================
 
 // Accumulate float scalar gradient accumulators into bf16 gradient buffers on GPU
-// acc layout: [0..10] resid_attn, [11..21] resid_mlp, [22..32] x0_lambda,
-//   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
-// negate_backout: if true, subtract acc[88] instead of add (forward was subtraction)
+// acc layout: [0..10] resid_attn, ..., [112] smear_lambda, [113..124] smear_gate_w
 void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
                              bf16* post_lambda_grads, bf16* scalar_grads,
-                             const float* acc, int num_layers,
-                             float skip_lambda_factor, cudaStream_t stream);
+                             bf16* smear_gate_grads, const float* acc,
+                             int num_layers, float skip_lambda_factor,
+                             cudaStream_t stream);

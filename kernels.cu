@@ -1349,6 +1349,89 @@ void smear_forward(bf16* out, const bf16* x, const bf16* smear_gate_w,
         out, x, smear_gate_w, smear_lambda, num_tokens, model_dim);
 }
 
+// Smear backward: compute grad w.r.t. raw embeddings and accumulate scalar grads
+// Forward was: out[0] = x[0], out[t] = x[t] + gate[t]*x[t-1] for t >= 1
+//   where gate[t] = smear_lambda * sigmoid(gate_w @ x[t, :12])
+// Backward computes:
+//   grad_raw[t] = grad_smeared[t] + gate[t+1]*grad_smeared[t+1]  (shift)
+//   + gate input backward for first 12 dims
+// Also accumulates smear_lambda and gate_w scalar gradients
+__global__ void smear_backward_kernel(
+    bf16* __restrict__ grad_raw,
+    const bf16* __restrict__ grad_smeared,
+    const bf16* __restrict__ x_raw,
+    const bf16* __restrict__ gate_w,
+    float smear_lambda,
+    float* __restrict__ grad_smear_lambda,
+    float* __restrict__ grad_gate_w,
+    int T, int D)
+{
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    __shared__ float s_grad_gate;
+    __shared__ float s_sig_deriv;
+    __shared__ float s_gate_next;
+    __shared__ float warp_sums[8];
+
+    // Phase 1: D-dimension reduction for grad_gate[t] = dot(grad_smeared[t], x_raw[t-1])
+    float local_sum = 0.0f;
+    if (t >= 1) {
+        for (int d = threadIdx.x; d < D; d += blockDim.x)
+            local_sum += bf16_to_f(grad_smeared[t * D + d]) * bf16_to_f(x_raw[(t - 1) * D + d]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+        int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        if (lane == 0) warp_sums[warp] = local_sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (t >= 1) {
+            float dot = 0.0f;
+            for (int w = 0; w < blockDim.x / 32; w++) dot += warp_sums[w];
+            s_grad_gate = dot;
+
+            float z = 0.0f;
+            for (int j = 0; j < 12; j++)
+                z += bf16_to_f(x_raw[t * D + j]) * bf16_to_f(gate_w[j]);
+            float sig = 1.0f / (1.0f + expf(-z));
+            s_sig_deriv = sig * (1.0f - sig);
+
+            atomicAdd(grad_smear_lambda, sig * dot);
+            for (int j = 0; j < 12; j++)
+                atomicAdd(&grad_gate_w[j],
+                          smear_lambda * sig * (1.0f - sig) * dot * bf16_to_f(x_raw[t * D + j]));
+        }
+        if (t < T - 1) {
+            float z = 0.0f;
+            for (int j = 0; j < 12; j++)
+                z += bf16_to_f(x_raw[(t + 1) * D + j]) * bf16_to_f(gate_w[j]);
+            s_gate_next = smear_lambda / (1.0f + expf(-z));
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: Compute grad_raw
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float g = bf16_to_f(grad_smeared[t * D + d]);
+        if (t < T - 1)
+            g += s_gate_next * bf16_to_f(grad_smeared[(t + 1) * D + d]);
+        if (t >= 1 && d < 12)
+            g += s_grad_gate * smear_lambda * s_sig_deriv * bf16_to_f(gate_w[d]);
+        grad_raw[t * D + d] = f_to_bf16(g);
+    }
+}
+
+void smear_backward(bf16* grad_raw, const bf16* grad_smeared, const bf16* x_raw,
+                    const bf16* gate_w, float smear_lambda,
+                    float* grad_smear_lambda, float* grad_gate_w,
+                    int num_tokens, int model_dim, cudaStream_t stream) {
+    smear_backward_kernel<<<num_tokens, 256, 0, stream>>>(
+        grad_raw, grad_smeared, x_raw, gate_w, smear_lambda,
+        grad_smear_lambda, grad_gate_w, num_tokens, model_dim);
+}
+
 // ============================================================================
 // Optimizer kernels
 // ============================================================================
@@ -1807,6 +1890,24 @@ void fill_constant_f32(float* out, float val, int n, cudaStream_t stream) {
     fill_constant_f32_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, val, n);
 }
 
+// BF16 L2 norm: returns sqrt(sum(x[i]^2))
+__global__ void bf16_l2_norm_kernel(float* __restrict__ out, const bf16* __restrict__ x, int n) {
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = bf16_to_f(x[i]);
+        sum += v * v;
+    }
+    sum = block_reduce_sum(sum);
+    if (threadIdx.x == 0) out[0] = sum;
+}
+
+float bf16_l2_norm(const bf16* x, int n, float* scratch, cudaStream_t stream) {
+    bf16_l2_norm_kernel<<<1, min(1024, n), 0, stream>>>(scratch, x, n);
+    float sum_sq;
+    cudaMemcpy(&sum_sq, scratch, sizeof(float), cudaMemcpyDeviceToHost);
+    return sqrtf(sum_sq);
+}
+
 // Dot product: *out += sum(a[i] * b[i])
 __global__ void bf16_dot_product_kernel(float* __restrict__ out,
                                          const bf16* __restrict__ a,
@@ -2129,6 +2230,56 @@ void key_offset_shift(bf16* k, const int32_t* cu_seqlens, int num_seqs,
         }
     }
     free(h_seqlens);
+}
+
+// Key offset shift backward: reverse the forward shift on gradient dK
+// Forward: k[t, :, HD/2:] = k[t-1, :, HD/2:]  for t > doc_start
+// Backward: dk_in[doc_start] = dk_out[doc_start] + dk_out[doc_start+1]
+//           dk_in[t] = dk_out[t+1]  for doc_start < t < doc_end-1
+//           dk_in[doc_end-1] = 0
+__global__ void key_offset_shift_backward_kernel(
+    bf16* __restrict__ dk,
+    const bf16* __restrict__ dk_orig,
+    const int32_t* __restrict__ cu_seqlens,
+    int num_seqs, int H, int HD)
+{
+    int pos = blockIdx.x;
+    int head = blockIdx.y;
+    int d = threadIdx.x;
+    if (d >= HD / 2) return;
+
+    // Find document boundaries
+    int doc_start = -1, doc_end = -1;
+    for (int s = 0; s < num_seqs; s++) {
+        if (pos >= cu_seqlens[s] && pos < cu_seqlens[s + 1]) {
+            doc_start = cu_seqlens[s];
+            doc_end = cu_seqlens[s + 1];
+            break;
+        }
+    }
+    if (doc_start < 0 || doc_end - doc_start <= 1) return;
+
+    int idx = pos * H * HD + head * HD + HD / 2 + d;
+
+    if (pos == doc_start) {
+        int next_idx = (pos + 1) * H * HD + head * HD + HD / 2 + d;
+        dk[idx] = f_to_bf16(bf16_to_f(dk_orig[idx]) + bf16_to_f(dk_orig[next_idx]));
+    } else if (pos < doc_end - 1) {
+        int next_idx = (pos + 1) * H * HD + head * HD + HD / 2 + d;
+        dk[idx] = dk_orig[next_idx];
+    } else {
+        dk[idx] = f_to_bf16(0.0f);
+    }
+}
+
+void key_offset_shift_backward(bf16* dk, const bf16* dk_orig,
+                                const int32_t* cu_seqlens, int num_seqs,
+                                int total_T, int H, int HD,
+                                cudaStream_t stream) {
+    dim3 grid(total_T, H);
+    dim3 block(HD / 2);
+    key_offset_shift_backward_kernel<<<grid, block, 0, stream>>>(
+        dk, dk_orig, cu_seqlens, num_seqs, H, HD);
 }
 
 // ============================================================================
@@ -2492,18 +2643,26 @@ void gate_input_grad_2src(bf16* grad_x, bf16* grad_ve, const float* grad_sigmoid
 // acc layout: [0..10] resid_attn, [11..21] resid_mlp, [22..32] x0_lambda,
 //   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda,
 //   [89..110] sa_lambda (2 per layer: [89+2*i]=sa_lambda0, [89+2*i+1]=sa_lambda1),
-//   [111] skip_lambda raw dot (pre-multiplied by skip_lambda_factor in kernel)
+//   [111] skip_lambda raw dot, [112] smear_lambda, [113..124] smear_gate_w
 __global__ void accumulate_scalar_grads_kernel(
     bf16* resid_grads,       // [num_layers * 2]
     bf16* x0_grads,          // [num_layers]
     bf16* bigram_grads,      // [num_layers]
     bf16* post_lambda_grads, // [num_layers * 4]
     bf16* scalar_grads,      // [2*num_layers + 3]
-    const float* acc,        // [112] float accumulators
+    bf16* smear_gate_grads,  // [12]
+    const float* acc,        // [125] float accumulators
     int num_layers,
     float skip_lambda_factor) // (1 - sigmoid(skip_lambda_raw))
 {
     int i = threadIdx.x;
+
+    // smear_gate_w gradients: acc[113..124] -> smear_gate_grads[0..11]
+    if (i < 12) {
+        float cur = __bfloat162float(smear_gate_grads[i]);
+        smear_gate_grads[i] = __float2bfloat16(cur + acc[113 + i]);
+    }
+
     if (i >= num_layers) return;
 
     // resid_lambdas: resid_grads[i*2+0] += acc[0+i] (attn), resid_grads[i*2+1] += acc[11+i] (mlp)
@@ -2541,15 +2700,22 @@ __global__ void accumulate_scalar_grads_kernel(
         int idx2 = 2 * num_layers + 2;
         float cur2 = __bfloat162float(scalar_grads[idx2]);
         scalar_grads[idx2] = __float2bfloat16(cur2 + skip_lambda_factor * acc[111]);
+
+        // smear_lambda: scalar_grads[2*num_layers] += acc[112]
+        int idx_smear = 2 * num_layers;
+        float cur_smear = __bfloat162float(scalar_grads[idx_smear]);
+        scalar_grads[idx_smear] = __float2bfloat16(cur_smear + acc[112]);
     }
 }
 
 void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
                              bf16* post_lambda_grads, bf16* scalar_grads,
-                             const float* acc, int num_layers,
-                             float skip_lambda_factor, cudaStream_t stream) {
-    // Single block, num_layers threads (11 threads)
-    accumulate_scalar_grads_kernel<<<1, num_layers, 0, stream>>>(
+                             bf16* smear_gate_grads, const float* acc,
+                             int num_layers, float skip_lambda_factor,
+                             cudaStream_t stream) {
+    // Single block, max(num_layers, 12) threads for layer + smear_gate handling
+    int threads = num_layers > 12 ? num_layers : 12;
+    accumulate_scalar_grads_kernel<<<1, threads, 0, stream>>>(
         resid_grads, x0_grads, bigram_grads, post_lambda_grads, scalar_grads,
-        acc, num_layers, skip_lambda_factor);
+        smear_gate_grads, acc, num_layers, skip_lambda_factor);
 }
