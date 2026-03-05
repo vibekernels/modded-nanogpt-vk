@@ -1786,6 +1786,39 @@ void bf16_to_fp8_e5m2(fp8e5m2* out, const bf16* x, float scale, int n, cudaStrea
     bf16_to_fp8_e5m2_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, x, scale, n);
 }
 
+// FP8 roundtrip: bf16 -> fp8 -> bf16 (introduces FP8 quantization noise)
+// data[i] = bf16(float(fp8_e5m2(bf16_to_f(data[i]) * pre_scale)) * post_scale)
+__global__ void bf16_roundtrip_fp8_e5m2_kernel(bf16* __restrict__ data,
+                                                float pre_scale, float post_scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = bf16_to_f(data[idx]) * pre_scale;
+    val = fminf(fmaxf(val, -57344.0f), 57344.0f);
+    val = float(__nv_fp8_e5m2(val));
+    data[idx] = f_to_bf16(val * post_scale);
+}
+
+void bf16_roundtrip_fp8_e5m2(bf16* data, float pre_scale, float post_scale, int n, cudaStream_t stream) {
+    int threads = 256;
+    bf16_roundtrip_fp8_e5m2_kernel<<<cdiv(n, threads), threads, 0, stream>>>(data, pre_scale, post_scale, n);
+}
+
+// data[i] = bf16(float(fp8_e4m3(bf16_to_f(data[i]) * pre_scale)) * post_scale)
+__global__ void bf16_roundtrip_fp8_e4m3_kernel(bf16* __restrict__ data,
+                                                float pre_scale, float post_scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = bf16_to_f(data[idx]) * pre_scale;
+    val = fminf(fmaxf(val, -448.0f), 448.0f);
+    val = float(__nv_fp8_e4m3(val));
+    data[idx] = f_to_bf16(val * post_scale);
+}
+
+void bf16_roundtrip_fp8_e4m3(bf16* data, float pre_scale, float post_scale, int n, cudaStream_t stream) {
+    int threads = 256;
+    bf16_roundtrip_fp8_e4m3_kernel<<<cdiv(n, threads), threads, 0, stream>>>(data, pre_scale, post_scale, n);
+}
+
 // ============================================================================
 // Nesterov momentum
 // ============================================================================

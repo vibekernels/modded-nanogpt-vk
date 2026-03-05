@@ -1196,7 +1196,7 @@ static void alloc_activations(Activations* act, int max_tokens) {
     total += (size_t)D * VOCAB_SIZE + ALIGN; n_buffers++; // w_f8
     // Logits + grad_logits
     total += TV2 + ALIGN; n_buffers++; // logits
-    total += TV1 + ALIGN; n_buffers++; // grad_logits (fp8e5m2)
+    total += TV2 + ALIGN; n_buffers++; // grad_logits (bf16, roundtripped through FP8)
     // Loss
     total += 2 * ((size_t)T * sizeof(float) + ALIGN); n_buffers += 2; // losses, lse
     // Per-layer saved (11 layers * 10 buffers)
@@ -1270,7 +1270,7 @@ static void alloc_activations(Activations* act, int max_tokens) {
     // Loss buffers
     BUMP(float, losses, (size_t)T * sizeof(float));
     BUMP(float, lse, (size_t)T * sizeof(float));
-    BUMP(fp8e5m2, grad_logits, TV1);
+    BUMP(bf16, grad_logits, TV2);
 
     // Skip buffers
     BUMP(bf16, skip_save, TD2);
@@ -2137,41 +2137,44 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
     BWD_TIMER_START();
 
-    // 1. Softcapped CE backward -> FP8-E5M2 gradients (matching Python's FP8 backward)
-    // grad_s = FP8_GRAD_SCALE: divides gradients before FP8 quantization, later multiplied back
+    // 1. Softcapped CE backward -> BF16 gradients (scaled by 1/grad_s)
     fill_constant_f32(act->scratch_f32, 1.0f / GRAD_ACCUM_STEPS, T, ctx->stream);
     CUDA_CHECK(cudaMemcpyAsync(act->scratch_f32 + T, mtp_weights, n_mtp * sizeof(float),
                                 cudaMemcpyHostToDevice, ctx->stream));
 
-    // FP8 CE backward: output FP8-E5M2 gradients scaled by 1/grad_s
-    softcapped_ce_bwd(act->grad_logits, act->scratch_f32, act->lse,
-                      act->logits, targets, act->scratch_f32 + T,
-                      T, VOCAB_SIZE, n_mtp,
-                      SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, FP8_GRAD_SCALE,
-                      ctx->stream);
+    softcapped_ce_bwd_bf16(act->grad_logits, act->scratch_f32, act->lse,
+                           act->logits, targets, act->scratch_f32 + T,
+                           T, VOCAB_SIZE, n_mtp,
+                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, FP8_GRAD_SCALE,
+                           ctx->stream);
 
+    // Roundtrip grad_logits through FP8-E5M2 to match Python's quantization noise
+    // Input: true_grad/grad_s (bf16). Output: float(fp8_e5m2(true_grad/grad_s)) * grad_s ≈ true_grad
+    bf16_roundtrip_fp8_e5m2(act->grad_logits, 1.0f, FP8_GRAD_SCALE, (size_t)T * VOCAB_SIZE, ctx->stream);
 
     BWD_TIMER_END(g_bwd_ce_ms);
     BWD_TIMER_START();
 
-    // 2. lm_head backward via FP8 matmul (matching Python's CastedLinearT backward)
-    // Convert lm_head [D,V] to FP8-E4M3 (stored temporarily in logits buffer)
-    fp8e4m3* w_f8 = (fp8e4m3*)act->logits;  // logits buffer is T*V*2 bytes >> D*V bytes
-    bf16_to_fp8_e4m3(w_f8, p->lm_head, 1.0f / FP8_W_SCALE, MODEL_DIM * VOCAB_SIZE, ctx->stream);
+    // 2. lm_head backward via BF16 matmul with FP8-roundtripped operands
+    // Roundtrip lm_head weights through FP8-E4M3 (copy to logits buffer first)
+    bf16* w_rt = act->logits;  // logits buffer is T*V bf16, >> D*V needed
+    CUDA_CHECK(cudaMemcpyAsync(w_rt, p->lm_head, (size_t)MODEL_DIM * VOCAB_SIZE * sizeof(bf16),
+                                cudaMemcpyDeviceToDevice, ctx->stream));
+    bf16_roundtrip_fp8_e4m3(w_rt, 1.0f / FP8_W_SCALE, FP8_W_SCALE, MODEL_DIM * VOCAB_SIZE, ctx->stream);
 
-    // grad_x = grad_logits_f8 @ w_f8.T * grad_s * w_s
-    gemm_fp8_backward_grad_x(ctx->cublaslt_handle, act->grad_logits, w_f8,
-                             act->grad_x, T, VOCAB_SIZE, MODEL_DIM,
-                             FP8_GRAD_SCALE, FP8_W_SCALE, ctx->stream);
+    // grad_x = grad_logits @ w_rt.T  (both already have FP8 noise baked in)
+    gemm_bf16_Bt(ctx->cublas_handle, act->grad_logits, w_rt, act->grad_x,
+                 T, MODEL_DIM, VOCAB_SIZE);
 
-    // Convert act->x [T,D] to FP8-E4M3 (stored temporarily after w_f8 in logits buffer)
-    fp8e4m3* x_f8 = (fp8e4m3*)(act->logits) + (size_t)MODEL_DIM * VOCAB_SIZE;
-    bf16_to_fp8_e4m3(x_f8, act->x, 1.0f / FP8_X_SCALE, T * MODEL_DIM, ctx->stream);
+    // Roundtrip act->x through FP8-E4M3 (copy to logits buffer after w_rt)
+    bf16* x_rt = w_rt + (size_t)MODEL_DIM * VOCAB_SIZE;
+    CUDA_CHECK(cudaMemcpyAsync(x_rt, act->x, (size_t)T * MODEL_DIM * sizeof(bf16),
+                                cudaMemcpyDeviceToDevice, ctx->stream));
+    bf16_roundtrip_fp8_e4m3(x_rt, 1.0f / FP8_X_SCALE, FP8_X_SCALE, T * MODEL_DIM, ctx->stream);
 
-    // grad_w = x_f8.T @ grad_logits_f8 * x_s * grad_s (accumulate to g->lm_head as BF16)
-    gemm_fp8_backward_grad_w_bf16(ctx->cublaslt_handle, x_f8, act->grad_logits,
-                                  g->lm_head, T, VOCAB_SIZE, MODEL_DIM,
-                                  FP8_X_SCALE, FP8_GRAD_SCALE, 1.0f, ctx->stream);
+    // grad_w += x_rt.T @ grad_logits  (accumulate to g->lm_head)
+    gemm_bf16_At(ctx->cublas_handle, x_rt, act->grad_logits, g->lm_head,
+                 MODEL_DIM, VOCAB_SIZE, T, 1.0f, 1.0f);
 
     // DIAG: grad_x norm after FP8 lm_head backward (before norm bwd)
     if (ctx->current_step == 0) {

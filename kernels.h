@@ -213,6 +213,11 @@ void bf16_to_fp8_e4m3(fp8e4m3* out, const bf16* x, float scale, int n, cudaStrea
 // Convert BF16 to FP8 e5m2 with scaling: out[i] = fp8(x[i] * scale)
 void bf16_to_fp8_e5m2(fp8e5m2* out, const bf16* x, float scale, int n, cudaStream_t stream);
 
+// FP8 roundtrip: quantize to FP8 and back to BF16 (introduces FP8 quantization noise)
+// data[i] = bf16(float(fp8(bf16_to_f(data[i]) * pre_scale)) * post_scale)
+void bf16_roundtrip_fp8_e5m2(bf16* data, float pre_scale, float post_scale, int n, cudaStream_t stream);
+void bf16_roundtrip_fp8_e4m3(bf16* data, float pre_scale, float post_scale, int n, cudaStream_t stream);
+
 // ============================================================================
 // Nesterov momentum (for Polar Express)
 // ============================================================================

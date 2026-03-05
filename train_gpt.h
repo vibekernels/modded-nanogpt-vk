@@ -274,7 +274,7 @@ typedef struct {
     // Loss computation
     float* losses;              // [T]
     float* lse;                 // [T] log-sum-exp
-    fp8e5m2* grad_logits;       // [T, VOCAB_SIZE] backward gradient in FP8
+    bf16* grad_logits;           // [T, VOCAB_SIZE] backward gradient (BF16, roundtripped through FP8)
 
     // Skip connection storage
     bf16* skip_save;            // [1, T, MODEL_DIM]
