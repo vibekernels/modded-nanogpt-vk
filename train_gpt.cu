@@ -2938,9 +2938,14 @@ void optimizer_step(TrainingContext* ctx, int step, int do_adam) {
         // Split embed at designated step
         if (step == opt->split_step) {
             // Copy lm_head optimizer state to embed (with transpose)
-            // For single GPU: simple transpose of exp_avg and exp_avg_sq
-            // TODO: implement optimizer state copy with transpose
+            // lm_head state: [MODEL_DIM, VOCAB_SIZE], embed state: [VOCAB_SIZE, MODEL_DIM]
+            AdamState* lm_s = &opt->adam_lm_head;
+            AdamState* em_s = &opt->adam_embed;
+            em_s->step = lm_s->step;
+            transpose_copy_f32(lm_s->exp_avg, em_s->exp_avg, MODEL_DIM, VOCAB_SIZE, stream);
+            transpose_copy_f32(lm_s->exp_avg_sq, em_s->exp_avg_sq, MODEL_DIM, VOCAB_SIZE, stream);
             opt->split_embed = 1;
+            fprintf(stderr, "Split embed/lm_head at step %d\n", step);
         }
     }
 

@@ -925,6 +925,30 @@ void transpose_add(const bf16* src, bf16* dst, int M, int N, cudaStream_t stream
     transpose_add_kernel<<<grid, block, 0, stream>>>(src, dst, M, N);
 }
 
+// Float32 transpose copy (for optimizer state)
+__global__ void transpose_copy_f32_kernel(const float* __restrict__ src,
+                                          float* __restrict__ dst,
+                                          int M, int N) {
+    __shared__ float tile[TRANSPOSE_TILE][TRANSPOSE_TILE + 1];
+    int bx = blockIdx.x * TRANSPOSE_TILE;
+    int by = blockIdx.y * TRANSPOSE_TILE;
+    int x = bx + threadIdx.x;
+    int y = by + threadIdx.y;
+    if (x < M && y < N)
+        tile[threadIdx.x][threadIdx.y] = src[x * N + y];
+    __syncthreads();
+    x = by + threadIdx.x;
+    y = bx + threadIdx.y;
+    if (x < N && y < M)
+        dst[x * M + y] = tile[threadIdx.y][threadIdx.x];
+}
+
+void transpose_copy_f32(const float* src, float* dst, int M, int N, cudaStream_t stream) {
+    dim3 block(TRANSPOSE_TILE, TRANSPOSE_TILE);
+    dim3 grid(cdiv(M, TRANSPOSE_TILE), cdiv(N, TRANSPOSE_TILE));
+    transpose_copy_f32_kernel<<<grid, block, 0, stream>>>(src, dst, M, N);
+}
+
 // ============================================================================
 // RoPE (Rotary Position Embeddings)
 // ============================================================================

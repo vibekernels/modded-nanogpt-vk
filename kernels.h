@@ -98,6 +98,9 @@ void transpose_copy(const bf16* src, bf16* dst, int M, int N, cudaStream_t strea
 // dst[N, M] += src[M, N].T  (tiled 32x32 coalesced transpose-add)
 void transpose_add(const bf16* src, bf16* dst, int M, int N, cudaStream_t stream);
 
+// dst[N, M] = src[M, N].T  (float32, for optimizer state)
+void transpose_copy_f32(const float* src, float* dst, int M, int N, cudaStream_t stream);
+
 // ============================================================================
 // RoPE (Rotary Position Embeddings)
 // ============================================================================
