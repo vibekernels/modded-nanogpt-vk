@@ -1,0 +1,87 @@
+DIAG step=0 micro=0 scalar_grad_acc: resid_attn[0]=0.266191 resid_mlp[0]=0.212388 x0_lambda[0]=0.266191 x0_lambda[1]=0.241462 bigram_lambda[0]=0.000000 post_lambda[0]=0.000000 backout=0.115126 sa_lambda[0,0]=-0.125949 sa_lambda[0,1]=-0.057924 skip=0.014454 smear=-39.776501
+DIAG step=0 micro=0 BEFORE accum: x0_grads[0]=0.000000 x0_grads[1]=0.000000 resid_grads[0]=0.000000 resid_grads[1]=0.000000
+=== Step 0 gradient norms (after 8 microsteps) ===
+  grad_norm attn_bank            = 62.305687
+  grad_norm mlp_bank             = 3576.080566
+  grad_norm embed                = 4237.573242
+  grad_norm lm_head              = 5794.583496
+  grad_norm bigram_embed         = 2.280364
+  grad_norm value_embeds         = 2.925027
+  grad_norm attn_gate_bank       = 0.333993
+  grad_norm ve_gate_bank         = 0.051746
+  grad_norm smear_gate           = 0.000000
+  grad_norm skip_gate            = 0.047146
+  grad_norm scalars              = 302.007599
+  grad_norm post_lambdas         = 0.292176
+  grad_norm x0_lambdas           = 2.976418
+  grad_norm bigram_lambdas       = 0.000000
+  grad_norm resid_lambdas        = 2.690776
+=== Step 0 parameter norms (before optimizer step) ===
+=== Step 0 parameter norms (AFTER optimizer step, do_adam=0) ===
+  post_opt_param_norm attn_bank            = 87.471008
+  post_opt_param_norm mlp_bank             = 95.783325
+  post_opt_param_norm embed                = 31.079103
+  post_opt_param_norm lm_head              = 31.079103
+  post_opt_param_norm scalars              = 4.031129
+  post_opt_param_norm resid_lambdas        = 4.910279
+  post_opt_param_norm post_lambdas         = 7.000000
+  post_opt_param_norm x0_lambdas           = 0.000000
+  post_opt_param_norm bigram_lambdas       = 0.165993
+DIAG step=1 micro=0 scalar_grad_acc: resid_attn[0]=191.879517 resid_mlp[0]=191.793304 x0_lambda[0]=191.879623 x0_lambda[1]=175.068832 bigram_lambda[0]=0.000000 post_lambda[0]=0.000000 backout=64.689514 sa_lambda[0,0]=-0.189494 sa_lambda[0,1]=-0.071915 skip=16.309980 smear=-43.352825
+DIAG step=1 micro=0 BEFORE accum: x0_grads[0]=1.453125 x0_grads[1]=1.343750 resid_grads[0]=1.453125 resid_grads[1]=1.031250
+=== Step 0 gradient norms (after 8 microsteps) ===
+  grad_norm attn_bank            = 106.625427
+  grad_norm mlp_bank             = 3201.618408
+  grad_norm embed                = 5954.639648
+  grad_norm lm_head              = 16132.767578
+  grad_norm bigram_embed         = 3.496061
+  grad_norm value_embeds         = 4.546611
+  grad_norm attn_gate_bank       = 0.754996
+  grad_norm ve_gate_bank         = 0.099985
+  grad_norm smear_gate           = 0.000000
+  grad_norm skip_gate            = 20.431067
+  grad_norm scalars              = 820.723816
+  grad_norm post_lambdas         = 450.289581
+  grad_norm x0_lambdas           = 3061.165771
+  grad_norm bigram_lambdas       = 0.000000
+  grad_norm resid_lambdas        = 4028.245361
+=== Step 0 parameter norms (before optimizer step) ===
+=== Step 1 parameter norms (AFTER optimizer step, do_adam=1) ===
+  post_opt_param_norm attn_bank            = 87.571747
+  post_opt_param_norm mlp_bank             = 98.986877
+  post_opt_param_norm embed                = 58.401138
+  post_opt_param_norm lm_head              = 58.401134
+  post_opt_param_norm scalars              = 4.196820
+  post_opt_param_norm resid_lambdas        = 4.735541
+  post_opt_param_norm post_lambdas         = 7.027946
+  post_opt_param_norm x0_lambdas           = 0.025284
+  post_opt_param_norm bigram_lambdas       = 0.165993
+DIAG step=2 micro=0 scalar_grad_acc: resid_attn[0]=777.492737 resid_mlp[0]=770.851013 x0_lambda[0]=779.832458 x0_lambda[1]=765.520081 bigram_lambda[0]=-46.383358 post_lambda[0]=0.000000 backout=571.601257 sa_lambda[0,0]=-4.894220 sa_lambda[0,1]=-0.531673 skip=77.886070 smear=-256.312531
+DIAG step=2 micro=0 BEFORE accum: x0_grads[0]=0.000000 x0_grads[1]=0.000000 resid_grads[0]=0.000000 resid_grads[1]=0.000000
+=== Step 0 gradient norms (after 8 microsteps) ===
+  grad_norm attn_bank            = 7794.711914
+  grad_norm mlp_bank             = 18189.320312
+  grad_norm embed                = 2642.751465
+  grad_norm lm_head              = 25510.689453
+  grad_norm bigram_embed         = 4.561035
+  grad_norm value_embeds         = 15.435098
+  grad_norm attn_gate_bank       = 202.929794
+  grad_norm ve_gate_bank         = 980.537109
+  grad_norm smear_gate           = 0.217603
+  grad_norm skip_gate            = 727.672485
+  grad_norm scalars              = 5950.106445
+  grad_norm post_lambdas         = 1798.356079
+  grad_norm x0_lambdas           = 20213.125000
+  grad_norm bigram_lambdas       = 1020.302551
+  grad_norm resid_lambdas        = 24151.097656
+=== Step 0 parameter norms (before optimizer step) ===
+=== Step 2 parameter norms (AFTER optimizer step, do_adam=0) ===
+  post_opt_param_norm attn_bank            = 87.376160
+  post_opt_param_norm mlp_bank             = 102.017281
+  post_opt_param_norm embed                = 58.401138
+  post_opt_param_norm lm_head              = 58.401134
+  post_opt_param_norm scalars              = 4.196820
+  post_opt_param_norm resid_lambdas        = 4.735541
+  post_opt_param_norm post_lambdas         = 7.027946
+  post_opt_param_norm x0_lambdas           = 0.025284
+  post_opt_param_norm bigram_lambdas       = 0.165993
