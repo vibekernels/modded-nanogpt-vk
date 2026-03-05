@@ -292,6 +292,47 @@ static void gemm_fp8_backward_grad_w(cublasLtHandle_t handle,
     cublasLtMatmulDescDestroy(matmulDesc);
 }
 
+// FP8 backward: grad_w[K,N] = x_f8[M,K].T @ grad_f8[M,N] -> BF16 output with accumulation
+static void gemm_fp8_backward_grad_w_bf16(cublasLtHandle_t handle,
+                                      const fp8e4m3* x_f8, const fp8e5m2* grad_f8,
+                                      bf16* grad_w,
+                                      int M, int N, int K,
+                                      float x_scale, float grad_scale,
+                                      float beta,
+                                      cudaStream_t stream) {
+    cublasLtMatmulDesc_t matmulDesc;
+    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+    cublasOperation_t transA = CUBLAS_OP_N;
+    cublasOperation_t transB = CUBLAS_OP_T;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E5M2, N, M, N));   // grad cm: [N,M]
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E4M3, K, M, K));   // x_f8 cm: [K,M]
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, N, K, N));       // grad_w cm: [N,K] BF16
+
+    float alpha = x_scale * grad_scale;
+
+    CUBLAS_CHECK(cublasLtMatmul(
+        handle, matmulDesc,
+        &alpha,
+        grad_f8, Adesc,
+        x_f8, Bdesc,
+        &beta,
+        grad_w, Cdesc,
+        grad_w, Cdesc,
+        NULL, NULL, 0, stream
+    ));
+
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Cdesc);
+    cublasLtMatmulDescDestroy(matmulDesc);
+}
+
 // ============================================================================
 // Section A2: cuDNN Flash Attention (SDPA)
 // ============================================================================
@@ -1643,6 +1684,16 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
         ragged_offsets, act->seq_len_scratch,
         bucketed, attn_H, s_max, HD);
 
+    // DEBUG: Print dQ/dK/dV norms at step 0
+    if (ctx->current_step == 0 && attn_idx == 0) {
+        float dq_norm = bf16_l2_norm(dQ, T * H * HD, act->scratch_f32 + T + 256, ctx->stream);
+        float dk_norm = bf16_l2_norm(dK, T * H * HD, act->scratch_f32 + T + 256, ctx->stream);
+        float dv_norm = bf16_l2_norm(dV, T * H * HD, act->scratch_f32 + T + 256, ctx->stream);
+        float do_norm = bf16_l2_norm(grad_gated, T * D, act->scratch_f32 + T + 256, ctx->stream);
+        fprintf(stderr, "SDPA BWD layer %d: dQ=%.4f dK=%.4f dV=%.4f dO=%.4f\n",
+                layer_idx, dq_norm, dk_norm, dv_norm, do_norm);
+    }
+
     // Step 3b: VE gate backward (value embeddings gating: V += gate * ve)
     // Step 3b: VE gate backward (value embeddings gating: V += gate * ve)
     // dV from cuDNN is gradient w.r.t. modified V. Propagate through VE gating.
@@ -1920,7 +1971,13 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                             bm_sizes[i], is_paired_layer[i], key_offsets[i],
                             y_cos, y_sin, attn_scale_val, is_training);
 
-            // lane0 = resid_attn * lane0 + attn_out + x0_lambda * x0
+            // Save attention output for pl_attn_ln0 scalar gradient in backward
+            if (is_training) {
+                CUDA_CHECK(cudaMemcpyAsync(act->saved_attn_proj[i], act->scratch1, T * D * sizeof(bf16), cudaMemcpyDeviceToDevice, ctx->stream));
+            }
+
+            // lane0 = resid_attn * lane0 + 1.0 * attn_out + x0_lambda * x0
+            // (single-stream: no post_lambdas_attn_ln0, matches Python line 1365)
             fused_add3(act->lane0, act->lane0, act->scratch1, act->x0,
                        resid_attn, 1.0f, x0_lambda, T * D, ctx->stream);
             if (i > 0) {
@@ -2080,34 +2137,47 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
     BWD_TIMER_START();
 
-    // 1. Softcapped CE backward -> BF16 gradients
-    // Scale by 1/GRAD_ACCUM_STEPS to match Python: loss = losses.sum() * grad_scale
-    // where grad_scale = 1/grad_accum_steps. Each token's upstream gradient = grad_scale.
+    // 1. Softcapped CE backward -> FP8-E5M2 gradients (matching Python's FP8 backward)
+    // grad_s = FP8_GRAD_SCALE: divides gradients before FP8 quantization, later multiplied back
     fill_constant_f32(act->scratch_f32, 1.0f / GRAD_ACCUM_STEPS, T, ctx->stream);
     CUDA_CHECK(cudaMemcpyAsync(act->scratch_f32 + T, mtp_weights, n_mtp * sizeof(float),
                                 cudaMemcpyHostToDevice, ctx->stream));
 
-    // Use logits buffer as BF16 grad output (logits no longer needed after CE backward)
-    bf16* grad_logits_bf16 = act->logits;
-    softcapped_ce_bwd_bf16(grad_logits_bf16, act->scratch_f32, act->lse,
-                           act->logits, targets, act->scratch_f32 + T,
-                           T, VOCAB_SIZE, n_mtp,
-                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, 1.0f,
-                           ctx->stream);
+    // FP8 CE backward: output FP8-E5M2 gradients scaled by 1/grad_s
+    softcapped_ce_bwd(act->grad_logits, act->scratch_f32, act->lse,
+                      act->logits, targets, act->scratch_f32 + T,
+                      T, VOCAB_SIZE, n_mtp,
+                      SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, FP8_GRAD_SCALE,
+                      ctx->stream);
+
 
     BWD_TIMER_END(g_bwd_ce_ms);
     BWD_TIMER_START();
 
-    // 2. lm_head backward via BF16 matmul
-    // grad_x = grad_logits @ lm_head.T  (= [T,V] @ [V,D] = [T,D])
-    // lm_head is stored as [D,V], so grad_logits[T,V] @ lm_head.T[V,D] = gemm_bf16_Bt
-    gemm_bf16_Bt(ctx->cublas_handle, grad_logits_bf16, p->lm_head,
-                 act->grad_x, T, D, VOCAB_SIZE);
+    // 2. lm_head backward via FP8 matmul (matching Python's CastedLinearT backward)
+    // Convert lm_head [D,V] to FP8-E4M3 (stored temporarily in logits buffer)
+    fp8e4m3* w_f8 = (fp8e4m3*)act->logits;  // logits buffer is T*V*2 bytes >> D*V bytes
+    bf16_to_fp8_e4m3(w_f8, p->lm_head, 1.0f / FP8_W_SCALE, MODEL_DIM * VOCAB_SIZE, ctx->stream);
 
-    // grad_w = grad_logits.T @ x  (= [V,T] @ [T,D] = [V,D])
-    // But lm_head is stored as [D,V], so we need [D,V] += x.T @ grad_logits
-    gemm_bf16_At(ctx->cublas_handle, act->x, grad_logits_bf16, g->lm_head,
-                 D, VOCAB_SIZE, T, 1.0f, 1.0f);  // beta=1: accumulate
+    // grad_x = grad_logits_f8 @ w_f8.T * grad_s * w_s
+    gemm_fp8_backward_grad_x(ctx->cublaslt_handle, act->grad_logits, w_f8,
+                             act->grad_x, T, VOCAB_SIZE, MODEL_DIM,
+                             FP8_GRAD_SCALE, FP8_W_SCALE, ctx->stream);
+
+    // Convert act->x [T,D] to FP8-E4M3 (stored temporarily after w_f8 in logits buffer)
+    fp8e4m3* x_f8 = (fp8e4m3*)(act->logits) + (size_t)MODEL_DIM * VOCAB_SIZE;
+    bf16_to_fp8_e4m3(x_f8, act->x, 1.0f / FP8_X_SCALE, T * MODEL_DIM, ctx->stream);
+
+    // grad_w = x_f8.T @ grad_logits_f8 * x_s * grad_s (accumulate to g->lm_head as BF16)
+    gemm_fp8_backward_grad_w_bf16(ctx->cublaslt_handle, x_f8, act->grad_logits,
+                                  g->lm_head, T, VOCAB_SIZE, MODEL_DIM,
+                                  FP8_X_SCALE, FP8_GRAD_SCALE, 1.0f, ctx->stream);
+
+    // DIAG: grad_x norm after FP8 lm_head backward (before norm bwd)
+    if (ctx->current_step == 0) {
+        float gx_norm = bf16_l2_norm(act->grad_x, T * D, act->scratch_f32 + T + 256, ctx->stream);
+        fprintf(stderr, "DIAG grad_x_pre_norm=%.4f\n", gx_norm);
+    }
 
     // Read scalars early (needed for pre-norm recomputation in step 3)
     const bf16* h_scalars = cs->scalars;
@@ -2124,7 +2194,12 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
         rms_norm_bwd(act->grad_x, act->grad_x, pre_norm_final, T, D, ctx->stream);
     }
 
-    // 4. Backout/lane-merge backward
+        // DIAG: grad_x after final norm backward
+    if (ctx->current_step == 0) {
+        float gx_norm = bf16_l2_norm(act->grad_x, T * D, act->scratch_f32 + T + 256, ctx->stream);
+        fprintf(stderr, "DIAG grad_x_post_norm=%.4f\n", gx_norm);
+    }
+// 4. Backout/lane-merge backward
     // Forward: x = 0.5*(lane0+lane1) - backout_lambda*x_backout
     // Backward: grad_lane0 += 0.5*grad_x, grad_lane1 += 0.5*grad_x
     // grad_x_backout -= backout_lambda * grad_x
@@ -2133,7 +2208,13 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     scale_tensor(act->grad_lane0, 0.5f, T * D, ctx->stream);
     scale_tensor(act->grad_lane1, 0.5f, T * D, ctx->stream);
 
-    // Per-layer window sizes and attention scale (mirrors forward_pass setup)
+        // DIAG: grad_lane0/lane1 after lane merge
+    if (ctx->current_step == 0) {
+        float gl0 = bf16_l2_norm(act->grad_lane0, T * D, act->scratch_f32 + T + 256, ctx->stream);
+        float gl1 = bf16_l2_norm(act->grad_lane1, T * D, act->scratch_f32 + T + 256, ctx->stream);
+        fprintf(stderr, "DIAG lane_merge grad_lane0=%.4f grad_lane1=%.4f\n", gl0, gl1);
+    }
+// Per-layer window sizes and attention scale (mirrors forward_pass setup)
     int bm_sizes[NUM_LAYERS] = {ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, 0,
                                  ws_short, ws_short, ws_short, ws_long};
     int key_offsets[NUM_LAYERS];
@@ -2362,6 +2443,11 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 fused_add_scale(grad_x0_bigram, grad_x0_bigram, act->grad_lane0, 1.0f, bigram_lambda, T * D, ctx->stream);
             }
 
+            // No pl_attn_ln0 scalar gradient for single-stream layers (Python doesn't use it)
+            // Compute grad_attn = 1.0 * grad_post_attn (for attention backward)
+            bf16* grad_attn_single = act->scratch1;
+            CUDA_CHECK(cudaMemcpyAsync(grad_attn_single, act->grad_lane0, T * D * sizeof(bf16), cudaMemcpyDeviceToDevice, ctx->stream));
+            
             // Residual backward: grad_lane0 *= resid_attn
             scale_tensor(act->grad_lane0, resid_attn, T * D, ctx->stream);
 
@@ -2389,7 +2475,7 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 bf16* g_ve_gw = (ve_gate_map[i] >= 0) ?
                     g->ve_gate_bank + ve_gate_map[i] * NUM_HEADS * 12 : NULL;
 
-                attention_backward(ctx, attn_bank_idx, act->grad_lane0, grad_normed_attn,
+                attention_backward(ctx, attn_bank_idx, grad_attn_single, grad_normed_attn,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
                                   T, bm_sizes[i], train_max_seq_len,
@@ -2524,6 +2610,13 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
             }
 
             attn_bank_idx--;
+        }
+
+        
+        // DIAG: per-layer grad_lane0 norm
+        if (ctx->current_step == 0) {
+            float gl0 = bf16_l2_norm(act->grad_lane0, T * D, act->scratch_f32 + T + 256, ctx->stream);
+            fprintf(stderr, "DIAG layer %d grad_lane0=%.4f\n", i, gl0);
         }
 
         // Merge lanes at PARALLEL_START backward

@@ -38,10 +38,10 @@
 #define BOS_ID          50256
 #define GRAD_ACCUM_STEPS 8      // Single GPU: always 8
 
-// FP8 scales for lm_head
-#define LM_HEAD_X_S     (100.0f / 448.0f)
-#define LM_HEAD_W_S     (1.6f / 448.0f)
-#define LM_HEAD_GRAD_S  ((1.0f / 8.0f) * 0.75f / 448.0f)  // grad_scale * 0.75/448
+// FP8 scale factors matching Python's CastedLinearT for lm_head
+#define FP8_X_SCALE (100.0f / 448.0f)
+#define FP8_W_SCALE (1.6f / 448.0f)
+#define FP8_GRAD_SCALE ((1.0f / GRAD_ACCUM_STEPS) * 0.75f / 448.0f)
 
 // Softcap constants
 #define SOFTCAP_A       23.0f
