@@ -270,3 +270,15 @@ void naive_varlen_attention_backward(
 // k: [T, H, HD], shifts k[t, :, HD/2:] = k[t-1, :, HD/2:] for t > seq_start
 void key_offset_shift(bf16* k, const int32_t* cu_seqlens, int num_seqs,
                       int total_T, int H, int HD, cudaStream_t stream);
+
+// ============================================================================
+// Scalar gradient accumulation (GPU-side)
+// ============================================================================
+
+// Accumulate float scalar gradient accumulators into bf16 gradient buffers on GPU
+// acc layout: [0..10] resid_attn, [11..21] resid_mlp, [22..32] x0_lambda,
+//   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
+// negate_backout: if true, subtract acc[88] instead of add (forward was subtraction)
+void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
+                             bf16* post_lambda_grads, bf16* scalar_grads,
+                             const float* acc, int num_layers, cudaStream_t stream);

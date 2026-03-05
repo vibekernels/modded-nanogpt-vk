@@ -293,6 +293,394 @@ static void gemm_fp8_backward_grad_w(cublasLtHandle_t handle,
 }
 
 // ============================================================================
+// Section A2: cuDNN Flash Attention (SDPA)
+// ============================================================================
+
+// Helper kernel: compute ragged offsets from cu_seqlens
+// out[i] = cu_seqlens[i] * stride_mul  (converts token indices to element offsets)
+__global__ void compute_ragged_offsets_kernel(int32_t* out, const int32_t* in, int stride_mul, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i] * stride_mul;
+}
+
+static void compute_ragged_offsets(int32_t* out, const int32_t* in, int stride_mul, int n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    compute_ragged_offsets_kernel<<<grid, block, 0, stream>>>(out, in, stride_mul, n);
+}
+
+// Helper kernel: compute per-sequence lengths from cu_seqlens
+// seq_len[i] = cu_seqlens[i+1] - cu_seqlens[i], optionally scaled
+__global__ void compute_seq_lens_kernel(int32_t* out, const int32_t* cu_seqlens, int scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (cu_seqlens[i + 1] - cu_seqlens[i]) * scale;
+}
+
+static void compute_seq_lens(int32_t* out, const int32_t* cu_seqlens, int scale, int n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    compute_seq_lens_kernel<<<grid, block, 0, stream>>>(out, cu_seqlens, scale, n);
+}
+
+// Compute max sequence length from cu_seqlens (on host)
+static int compute_s_max(const int32_t* h_cu_seqlens, int num_seqs) {
+    int s_max = 0;
+    for (int i = 0; i < num_seqs; i++) {
+        int sl = h_cu_seqlens[i + 1] - h_cu_seqlens[i];
+        if (sl > s_max) s_max = sl;
+    }
+    return s_max;
+}
+
+// Build cuDNN SDPA forward graph
+static std::shared_ptr<fe::graph::Graph> build_cudnn_sdpa_forward(
+    cudnnHandle_t handle,
+    int num_seqs, int attn_H, int s_max, int HD,
+    float attn_scale, int window_left)
+{
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::BFLOAT16)
+          .set_intermediate_data_type(fe::DataType_t::FLOAT)
+          .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // Q, K, V: [num_seqs, attn_H, s_max, HD] with ragged offsets
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("Q")
+        .set_uid(UID_Q)
+        .set_dim({num_seqs, attn_H, s_max, HD})
+        .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+        .set_data_type(fe::DataType_t::BFLOAT16)
+        .set_ragged_offset(graph->tensor(fe::graph::Tensor_attributes()
+            .set_name("seq_q")
+            .set_uid(UID_SEQ_Q)
+            .set_dim({num_seqs + 1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::INT32))));
+
+
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("K")
+        .set_uid(UID_K)
+        .set_dim({num_seqs, attn_H, s_max, HD})
+        .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+        .set_data_type(fe::DataType_t::BFLOAT16)
+        .set_ragged_offset(graph->tensor(fe::graph::Tensor_attributes()
+            .set_name("seq_kv")
+            .set_uid(UID_SEQ_KV)
+            .set_dim({num_seqs + 1, 1, 1, 1})
+            .set_stride({1, 1, 1, 1})
+            .set_data_type(fe::DataType_t::INT32))));
+
+
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("V")
+        .set_uid(UID_V)
+        .set_dim({num_seqs, attn_H, s_max, HD})
+        .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+        .set_data_type(fe::DataType_t::BFLOAT16)
+        .set_ragged_offset(K->get_ragged_offset()));
+
+
+    // Per-sequence length tensors (required for padding mask with ragged offsets)
+    auto Seq_len_q = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_len_q")
+        .set_uid(UID_SEQ_LEN_Q)
+        .set_dim({num_seqs, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    auto Seq_len_kv = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_len_kv")
+        .set_uid(UID_SEQ_LEN_KV)
+        .set_dim({num_seqs, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    // SDPA options — padding mask required for ragged offsets
+    auto sdpa_opts = fe::graph::SDPA_attributes()
+        .set_name("sdpa_forward")
+        .set_is_inference(false)
+        .set_causal_mask(true)
+        .set_padding_mask(true)
+        .set_seq_len_q(Seq_len_q)
+        .set_seq_len_kv(Seq_len_kv)
+        .set_attn_scale(attn_scale);
+
+    if (window_left > 0) {
+        sdpa_opts.set_sliding_window_length(window_left);
+    }
+
+    auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_opts);
+
+
+    O->set_output(true)
+      .set_uid(UID_O)
+      .set_dim({num_seqs, attn_H, s_max, HD})
+      .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+      .set_data_type(fe::DataType_t::BFLOAT16);
+
+    Stats->set_output(true)
+          .set_uid(UID_STATS)
+          .set_data_type(fe::DataType_t::FLOAT);
+
+    auto status = graph->validate();
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd validate failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->build_operation_graph(handle);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd build failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->create_execution_plans({fe::HeurMode_t::A});
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd plan failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->check_support(handle);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd support check failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd build_plans failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+
+
+    return graph;
+}
+
+// Build cuDNN SDPA backward graph
+static std::shared_ptr<fe::graph::Graph> build_cudnn_sdpa_backward(
+    cudnnHandle_t handle,
+    int num_seqs, int attn_H, int s_max, int HD,
+    float attn_scale, int window_left)
+{
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::BFLOAT16)
+          .set_intermediate_data_type(fe::DataType_t::FLOAT)
+          .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // Ragged offset tensors
+    auto seq_q = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_q")
+        .set_uid(UID_SEQ_Q)
+        .set_dim({num_seqs + 1, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    auto seq_kv = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_kv")
+        .set_uid(UID_SEQ_KV)
+        .set_dim({num_seqs + 1, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    auto make_ragged_tensor = [&](const char* name, int uid) {
+        return graph->tensor(fe::graph::Tensor_attributes()
+            .set_name(name)
+            .set_uid(uid)
+            .set_dim({num_seqs, attn_H, s_max, HD})
+            .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+            .set_data_type(fe::DataType_t::BFLOAT16)
+            .set_ragged_offset(seq_q));
+    };
+
+    auto Q  = make_ragged_tensor("Q", UID_Q);
+    auto O  = make_ragged_tensor("O", UID_O);
+    auto dO = make_ragged_tensor("dO", UID_DO);
+
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("K")
+        .set_uid(UID_K)
+        .set_dim({num_seqs, attn_H, s_max, HD})
+        .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+        .set_data_type(fe::DataType_t::BFLOAT16)
+        .set_ragged_offset(seq_kv));
+
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("V")
+        .set_uid(UID_V)
+        .set_dim({num_seqs, attn_H, s_max, HD})
+        .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+        .set_data_type(fe::DataType_t::BFLOAT16)
+        .set_ragged_offset(seq_kv));
+
+    auto Stats = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("Stats")
+        .set_uid(UID_STATS)
+        .set_dim({num_seqs, attn_H, s_max, 1})
+        .set_stride({attn_H * s_max, s_max, 1, 1})
+        .set_data_type(fe::DataType_t::FLOAT));
+
+    // Per-sequence length tensors (required for padding mask with ragged offsets)
+    auto Seq_len_q = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_len_q")
+        .set_uid(UID_SEQ_LEN_Q)
+        .set_dim({num_seqs, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    auto Seq_len_kv = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("seq_len_kv")
+        .set_uid(UID_SEQ_LEN_KV)
+        .set_dim({num_seqs, 1, 1, 1})
+        .set_stride({1, 1, 1, 1})
+        .set_data_type(fe::DataType_t::INT32));
+
+    // SDPA backward options — padding mask required for ragged offsets
+    auto sdpa_bwd_opts = fe::graph::SDPA_backward_attributes()
+        .set_name("sdpa_backward")
+        .set_causal_mask(true)
+        .set_padding_mask(true)
+        .set_seq_len_q(Seq_len_q)
+        .set_seq_len_kv(Seq_len_kv)
+        .set_attn_scale(attn_scale);
+
+    if (window_left > 0) {
+        sdpa_bwd_opts.set_sliding_window_length(window_left);
+    }
+
+    auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, Stats, sdpa_bwd_opts);
+
+    dQ->set_output(true)
+       .set_uid(UID_DQ)
+       .set_dim({num_seqs, attn_H, s_max, HD})
+       .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+       .set_data_type(fe::DataType_t::BFLOAT16);
+
+    dK->set_output(true)
+       .set_uid(UID_DK)
+       .set_dim({num_seqs, attn_H, s_max, HD})
+       .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+       .set_data_type(fe::DataType_t::BFLOAT16);
+
+    dV->set_output(true)
+       .set_uid(UID_DV)
+       .set_dim({num_seqs, attn_H, s_max, HD})
+       .set_stride({attn_H * s_max * HD, HD, attn_H * HD, 1})
+       .set_data_type(fe::DataType_t::BFLOAT16);
+
+    auto status = graph->validate();
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd validate failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->build_operation_graph(handle);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd build failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->create_execution_plans({fe::HeurMode_t::A});
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd plan failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->check_support(handle);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd support check failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+    status = graph->build_plans(handle, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd build_plans failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+
+    return graph;
+}
+
+// Round up to next power of 2 (for graph caching)
+static int bucket_num_seqs(int n) {
+    if (n <= 1) return 1;
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// Get or build a cached cuDNN SDPA graph
+// Uses bucketed num_seqs to minimize graph rebuilds
+static std::shared_ptr<fe::graph::Graph> get_or_build_graph(
+    TrainingContext* ctx, int num_seqs, int attn_H, int s_max,
+    int window_left, int HD, float attn_scale, bool is_backward)
+{
+    int bucketed = bucket_num_seqs(num_seqs);
+    CudnnGraphCache::Key key = {bucketed, attn_H, s_max, window_left, attn_scale, is_backward};
+    auto it = ctx->cudnn_graph_cache.cache.find(key);
+    if (it != ctx->cudnn_graph_cache.cache.end()) {
+        return it->second;
+    }
+
+    auto graph = is_backward
+        ? build_cudnn_sdpa_backward(ctx->cudnn_handle, bucketed, attn_H, s_max, HD, attn_scale, window_left)
+        : build_cudnn_sdpa_forward(ctx->cudnn_handle, bucketed, attn_H, s_max, HD, attn_scale, window_left);
+
+    // Check workspace requirement and grow if needed
+    size_t needed = graph->get_workspace_size();
+    if (needed > ctx->act.attn_workspace_size) {
+        fprintf(stderr, "  cuDNN workspace: growing from %zu to %zu bytes\n",
+                ctx->act.attn_workspace_size, needed * 2);
+        cudaFree(ctx->act.attn_workspace);
+        ctx->act.attn_workspace_size = needed * 2;
+        CUDA_CHECK(cudaMalloc(&ctx->act.attn_workspace, ctx->act.attn_workspace_size));
+    }
+
+    ctx->cudnn_graph_cache.cache[key] = graph;
+    return graph;
+}
+
+// Execute cuDNN SDPA forward
+static void execute_cudnn_sdpa_forward(
+    TrainingContext* ctx,
+    std::shared_ptr<fe::graph::Graph>& graph,
+    bf16* Q, bf16* K, bf16* V,
+    bf16* O, float* stats,
+    int32_t* ragged_offsets, int32_t* seq_lens,
+    int num_seqs, int attn_H, int s_max, int HD)
+{
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {UID_Q, Q}, {UID_K, K}, {UID_V, V},
+        {UID_O, O}, {UID_STATS, stats},
+        {UID_SEQ_Q, ragged_offsets}, {UID_SEQ_KV, ragged_offsets},
+        {UID_SEQ_LEN_Q, seq_lens}, {UID_SEQ_LEN_KV, seq_lens}
+    };
+
+    auto status = graph->execute(ctx->cudnn_handle, variant_pack, ctx->act.attn_workspace);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA fwd execute failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+}
+
+// Execute cuDNN SDPA backward
+static void execute_cudnn_sdpa_backward(
+    TrainingContext* ctx,
+    std::shared_ptr<fe::graph::Graph>& graph,
+    bf16* dQ, bf16* dK, bf16* dV,
+    bf16* dO, bf16* Q, bf16* K, bf16* V,
+    bf16* O, float* stats,
+    int32_t* ragged_offsets, int32_t* seq_lens,
+    int num_seqs, int attn_H, int s_max, int HD)
+{
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {UID_Q, Q}, {UID_K, K}, {UID_V, V},
+        {UID_O, O}, {UID_DO, dO}, {UID_STATS, stats},
+        {UID_DQ, dQ}, {UID_DK, dK}, {UID_DV, dV},
+        {UID_SEQ_Q, ragged_offsets}, {UID_SEQ_KV, ragged_offsets},
+        {UID_SEQ_LEN_Q, seq_lens}, {UID_SEQ_LEN_KV, seq_lens}
+    };
+
+    auto status = graph->execute(ctx->cudnn_handle, variant_pack, ctx->act.attn_workspace);
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA bwd execute failed: %s\n", status.get_message().c_str());
+        exit(1);
+    }
+}
+
+// ============================================================================
 // Section B: Data Loading
 // ============================================================================
 
@@ -367,7 +755,8 @@ static int find_bos_positions(const uint16_t* tokens, int64_t num_tokens,
 static int construct_aligned_batch(const uint16_t* shard_tokens, int64_t shard_size,
                                    const int64_t* bos_pos, int num_bos, int* bos_idx_ptr,
                                    int num_tokens_local, int max_seq_len,
-                                   uint16_t* buf_out, int32_t* cum_lengths_out, int max_docs) {
+                                   uint16_t* buf_out, int32_t* cum_lengths_out, int max_docs,
+                                   int* num_seqs_out) {
     int bos_idx = *bos_idx_ptr;
     int cur_len = 0;
     int doc_count = 0;
@@ -404,6 +793,7 @@ static int construct_aligned_batch(const uint16_t* shard_tokens, int64_t shard_s
     cum_lengths_out[doc_count] = num_tokens_local;
 
     *bos_idx_ptr = bos_idx;
+    if (num_seqs_out) *num_seqs_out = doc_count;
     return cur_len;
 }
 
@@ -765,8 +1155,15 @@ static void alloc_activations(Activations* act, int max_tokens) {
     n_buffers += NUM_ATTN_LAYERS * 3;
     // Gradient scratch: 5 * T*D bf16
     total += 5 * (TD2 + ALIGN); n_buffers += 5;
-    // Attn backward f32: 3 * T*H*HD float
-    total += 3 * ((size_t)T * H * HD * sizeof(float) + ALIGN); n_buffers += 3;
+    // cuDNN attn stats: [num_seqs, attn_H, s_max, 1] per attention layer
+    // s_max is at most 2*2048=4096 (paired heads), attn_H * s_max ≤ 12288
+    // num_seqs_max ≈ T / min_seq_len (BOS-aligned, min ~128)
+    int num_seqs_max_est = T / 128 + 16;
+    int stats_per_seq = H * 2048;  // max(attn_H * s_max) = 6*2048 = 3*4096 = 12288
+    total += NUM_ATTN_LAYERS * ((size_t)num_seqs_max_est * stats_per_seq * sizeof(float) + ALIGN);
+    n_buffers += NUM_ATTN_LAYERS;
+    // cu_seqlens_paired scratch (max 4096 entries)
+    total += 4096 * sizeof(int32_t) + ALIGN; n_buffers += 1;
     // YaRN tables
     int max_sl = VAL_BATCH_SIZE / GRAD_ACCUM_STEPS;
     total += 2 * (2 * (size_t)max_sl * HD * sizeof(bf16) + ALIGN); // cos, sin
@@ -852,10 +1249,13 @@ static void alloc_activations(Activations* act, int max_tokens) {
     BUMP(bf16, grad_x0, TD2);
     BUMP(bf16, grad_x0_bigram, TD2);
 
-    // Float accumulators for naive attention backward
-    BUMP(float, attn_bwd_dQ_f32, (size_t)T * H * HD * sizeof(float));
-    BUMP(float, attn_bwd_dK_f32, (size_t)T * H * HD * sizeof(float));
-    BUMP(float, attn_bwd_dV_f32, (size_t)T * H * HD * sizeof(float));
+    // cuDNN flash attention stats (log-sum-exp) for backward
+    for (int i = 0; i < NUM_ATTN_LAYERS; i++) {
+        BUMP(float, attn_stats[i], (size_t)num_seqs_max_est * stats_per_seq * sizeof(float));
+    }
+    // cuDNN ragged offset scratch buffers
+    BUMP(int32_t, cu_seqlens_paired, 4096 * sizeof(int32_t));  // ragged offsets
+    BUMP(int32_t, seq_len_scratch, 4096 * sizeof(int32_t));    // per-seq lengths
 
     // YaRN tables
     BUMP(bf16, yarn_cos, 2 * (size_t)max_sl * HD * sizeof(bf16));
@@ -1014,13 +1414,36 @@ static void attention_forward(TrainingContext* ctx, int layer, int attn_idx,
                    T * 3 * H * HD * sizeof(bf16), cudaMemcpyDeviceToDevice, ctx->stream));
     }
 
-    // Step 5: Attention computation
-    // Use naive varlen attention with causal mask + sliding window
-    naive_varlen_attention(act->attn_out, Q, K, V,
-                          cu_seqlens, num_seqs,
-                          attn_T, attn_H, HD,
-                          attn_scale, window_size,
-                          ctx->stream);
+    // Step 5: cuDNN Flash Attention
+    int s_max = is_paired ? 2 * max_seq_len : max_seq_len;
+
+    // Compute element-offset ragged offsets for cuDNN
+    // cuDNN ragged offsets are element offsets, not token counts
+    // For both paired and non-paired: offset[i] = cu_seqlens[i] * H * HD
+    // (paired: 2*cu_seqlens[i] * (H/2)*HD = cu_seqlens[i]*H*HD, same formula)
+    int bucketed = bucket_num_seqs(num_seqs);
+    // cu_seqlens is pre-padded on host: entries [num_seqs+1..bucketed] = T
+    compute_ragged_offsets(act->cu_seqlens_paired, cu_seqlens,
+                          NUM_HEADS * HD, bucketed + 1, ctx->stream);
+    int32_t* ragged_offsets = act->cu_seqlens_paired;
+
+    // Compute per-sequence lengths in attention view
+    int seq_len_scale = is_paired ? 2 : 1;
+    compute_seq_lens(act->seq_len_scratch, cu_seqlens, seq_len_scale, bucketed, ctx->stream);
+
+    auto graph = get_or_build_graph(ctx, num_seqs, attn_H, s_max,
+                                     window_size, HD, attn_scale, /*is_backward=*/false);
+
+    execute_cudnn_sdpa_forward(ctx, graph,
+        Q, K, V, act->attn_out,
+        (is_training && attn_idx >= 0) ? act->attn_stats[attn_idx] : act->attn_stats[0],
+        ragged_offsets, act->seq_len_scratch,
+        bucketed, attn_H, s_max, HD);
+
+    // Save per-layer metadata for backward
+    if (is_training && attn_idx >= 0) {
+        act->saved_is_paired[attn_idx] = is_paired;
+    }
 
     // Step 6: Reshape output back to [T, H, HD] (for paired: [2T, H/2, HD] -> [T, H, HD])
     // The memory layouts are equivalent, so no actual reshape needed.
@@ -1099,6 +1522,7 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
                                 const bf16* saved_normed, // [T, D] saved input to attention
                                 int32_t* cu_seqlens, int num_seqs,
                                 int num_tokens, int window_size,
+                                int max_seq_len, int is_paired,
                                 float attn_scale) {
     Activations* act = &ctx->act;
     int T = num_tokens;
@@ -1133,8 +1557,10 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
     elementwise_mul_broadcast(grad_gated, grad_gated, act->saved_attn_gate[attn_idx],
                               T * H * HD, HD, T * H, ctx->stream);
 
-    // Step 4: Attention backward — compute dQ, dK, dV
-    // Use saved_qkv (Q, K, V after RMS norm + RoPE) from forward
+    // Step 4: Attention backward — compute dQ, dK, dV via cuDNN
+    int attn_H = is_paired ? H / 2 : H;
+    int s_max = is_paired ? 2 * max_seq_len : max_seq_len;
+
     const bf16* saved_Q = act->saved_qkv[attn_idx];
     const bf16* saved_K = act->saved_qkv[attn_idx] + T * H * HD;
     const bf16* saved_V = act->saved_qkv[attn_idx] + 2 * T * H * HD;
@@ -1144,15 +1570,27 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
     bf16* dK = act->k;   // [T, H, HD]
     bf16* dV = act->v;   // [T, H, HD]
 
-    naive_varlen_attention_backward(
+    // Compute element-offset ragged offsets for cuDNN
+    int bucketed = bucket_num_seqs(num_seqs);
+    compute_ragged_offsets(act->cu_seqlens_paired, cu_seqlens,
+                          NUM_HEADS * HD, bucketed + 1, ctx->stream);
+    int32_t* ragged_offsets = act->cu_seqlens_paired;
+
+    // Per-sequence lengths in attention view
+    int seq_len_scale = is_paired ? 2 : 1;
+    compute_seq_lens(act->seq_len_scratch, cu_seqlens, seq_len_scale, bucketed, ctx->stream);
+
+    auto graph = get_or_build_graph(ctx, num_seqs, attn_H, s_max,
+                                     window_size, HD, attn_scale, /*is_backward=*/true);
+
+    execute_cudnn_sdpa_backward(ctx, graph,
         dQ, dK, dV,
-        act->attn_bwd_dQ_f32, act->attn_bwd_dK_f32, act->attn_bwd_dV_f32,
-        grad_gated,    // d_out = gradient flowing into attention output
-        saved_Q, saved_K, saved_V,
-        cu_seqlens, num_seqs,
-        T, H, HD,
-        attn_scale, window_size,
-        ctx->stream);
+        grad_gated,                          // dO
+        (bf16*)saved_Q, (bf16*)saved_K, (bf16*)saved_V,
+        (bf16*)act->saved_attn_out[attn_idx], // O (saved attention output)
+        act->attn_stats[attn_idx],            // stats from forward
+        ragged_offsets, act->seq_len_scratch,
+        bucketed, attn_H, s_max, HD);
 
     // Step 4: Backward through QK RMS norm and RoPE (skip for now — these are
     // element-wise per position and the gradient is approximately pass-through
@@ -1181,7 +1619,8 @@ static void attention_backward(TrainingContext* ctx, int attn_idx,
 
 void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                   int32_t* cum_seqlens, int32_t* bigram_inputs,
-                  int num_tokens, float* mtp_weights, int n_mtp,
+                  int num_tokens, int num_seqs, const CachedScalars* cs,
+                  float* mtp_weights, int n_mtp,
                   int ws_short, int ws_long, int train_max_seq_len,
                   int is_training, float* loss_out) {
     ModelParams* p = &ctx->params;
@@ -1197,32 +1636,25 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     gather_embed(act->x0_bigram, p->bigram_embed, bigram_inputs, T, D, ctx->stream);
 
     // Smear token embedding forward 1 position
-    float smear_lambda = read_bf16_scalar(p->scalars + 2 * NUM_LAYERS);
+    float smear_lambda = __bfloat162float(cs->scalars[2 * NUM_LAYERS]);
     smear_forward(act->x, act->x, p->smear_gate, smear_lambda, T, D, ctx->stream);
 
     // x0 = norm(x) -- per-token RMS normalization
     rms_norm_fwd(act->x0, act->x, T, D, ctx->stream);
 
     // lane0 = x0 + bigram_lambdas[0] * x0_bigram
-    float bigram_lambda0 = read_bf16_scalar(p->bigram_lambdas);
+    float bigram_lambda0 = __bfloat162float(cs->bigram_lambdas[0]);
     fused_add_scale(act->lane0, act->x0, act->x0_bigram, 1.0f, bigram_lambda0, T * D, ctx->stream);
 
-    // Read scalars to host for layer loop
-    bf16 h_scalars[32];
-    CUDA_CHECK(cudaMemcpy(h_scalars, p->scalars, (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyDeviceToHost));
-
+    // Use cached scalars (no D2H copies needed)
+    const bf16* h_scalars = cs->scalars;
     float backout_lambda = __bfloat162float(h_scalars[2 * NUM_LAYERS + 1]);
     float skip_lambda_raw = __bfloat162float(h_scalars[2 * NUM_LAYERS + 2]);
 
-    // Read lambda arrays
-    bf16 h_resid[NUM_LAYERS * 2];
-    bf16 h_post_lambdas[NUM_LAYERS * 4];
-    bf16 h_x0_lambdas[NUM_LAYERS];
-    bf16 h_bigram_lambdas[NUM_LAYERS];
-    CUDA_CHECK(cudaMemcpy(h_resid, p->resid_lambdas, sizeof(h_resid), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_post_lambdas, p->post_lambdas, sizeof(h_post_lambdas), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_x0_lambdas, p->x0_lambdas, sizeof(h_x0_lambdas), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_bigram_lambdas, p->bigram_lambdas, sizeof(h_bigram_lambdas), cudaMemcpyDeviceToHost));
+    const bf16* h_resid = cs->resid_lambdas;
+    const bf16* h_post_lambdas = cs->post_lambdas;
+    const bf16* h_x0_lambdas = cs->x0_lambdas;
+    const bf16* h_bigram_lambdas = cs->bigram_lambdas;
 
     // Window sizes per layer (in tokens)
     int bm_sizes[NUM_LAYERS] = {ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, 0, ws_short, ws_short, ws_short, ws_long};
@@ -1240,17 +1672,8 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     // Value embed usage: layers that have ve gates use ve_embed[ve_gate_map[layer]]
     // ve_gate_map gives the index into ve_gate_bank AND value_embeds
 
-    // Compute num_seqs from cum_seqlens (need to know how many docs)
-    // The cum_seqlens array is on GPU. We need num_seqs from construct_aligned_batch.
-    // For now, derive it by looking for the last non-zero entry or from the batch construction.
-    // We'll pass num_seqs through - for now compute an upper bound
-    int32_t h_cum_sl[4096]; // max docs
-    int num_seqs = 0;
-    CUDA_CHECK(cudaMemcpy(h_cum_sl, cum_seqlens, (T / 300 + 128) * sizeof(int32_t), cudaMemcpyDeviceToHost));
-    for (int s = 1; s < T / 300 + 128; s++) {
-        if (h_cum_sl[s] >= T) { num_seqs = s; break; }
-    }
-    if (num_seqs == 0) num_seqs = 1; // fallback
+    // num_seqs passed in from caller (construct_aligned_batch)
+    act->saved_num_seqs = num_seqs;
 
     // Get YaRN attention scale
     float attn_scale_val = g_yarn.attn_scale;
@@ -1448,10 +1871,12 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                           T, VOCAB_SIZE, n_mtp,
                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, ctx->stream);
 
-        // Sum losses on GPU, copy single scalar to host, normalize by T
-        gpu_reduce_sum(act->scratch_f32, act->losses, T, ctx->stream);
-        CUDA_CHECK(cudaMemcpy(loss_out, act->scratch_f32, sizeof(float), cudaMemcpyDeviceToHost));
-        *loss_out /= T;
+        // Sum losses on GPU, copy to host if loss_out is non-null
+        if (loss_out) {
+            gpu_reduce_sum(act->scratch_f32, act->losses, T, ctx->stream);
+            CUDA_CHECK(cudaMemcpy(loss_out, act->scratch_f32, sizeof(float), cudaMemcpyDeviceToHost));
+            *loss_out /= T;
+        }
     } else {
         // Eval mode: BF16 lm_head matmul + softcapped CE
         // lm_head is [D, VOCAB_SIZE] (transposed), so x[T,D] @ lm_head[D,V] = logits[T,V]
@@ -1468,7 +1893,9 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, ctx->stream);
 
         gpu_reduce_sum(act->scratch_f32, act->losses, T, ctx->stream);
-        CUDA_CHECK(cudaMemcpy(loss_out, act->scratch_f32, sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        CUDA_CHECK(cudaMemcpyAsync(loss_out, act->scratch_f32, sizeof(float), cudaMemcpyDeviceToHost, ctx->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
         *loss_out /= T;
     }
 }
@@ -1477,9 +1904,15 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 // Section E: Backward Pass (stub - to be fully implemented)
 // ============================================================================
 
+// Global counters for backward section timing (accumulated across microsteps)
+static float g_bwd_ce_ms = 0, g_bwd_lmhead_ms = 0, g_bwd_layers_ms = 0, g_bwd_embed_ms = 0, g_bwd_scalgrad_ms = 0;
+static float g_bwd_attn_ms = 0, g_bwd_mlp_ms = 0, g_bwd_elemwise_ms = 0;
+static int g_bwd_profile_step = -1;
+
 void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                    int32_t* cum_seqlens, int32_t* bigram_inputs,
-                   int num_tokens, float* mtp_weights, int n_mtp,
+                   int num_tokens, int num_seqs, const CachedScalars* cs,
+                   float* mtp_weights, int n_mtp,
                    int ws_short, int ws_long, int train_max_seq_len) {
     // Manual backward pass - reverse order of forward
     // This is a large implementation that mirrors forward_pass in reverse
@@ -1489,6 +1922,12 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     Activations* act = &ctx->act;
     ModelParams* p = &ctx->params;
     ModelGrads* g = &ctx->grads;
+
+    // Section timing disabled (was adding cudaEventSynchronize pipeline stalls)
+    #define BWD_TIMER_START() do {} while(0)
+    #define BWD_TIMER_END(var) do {} while(0)
+
+    BWD_TIMER_START();
 
     // 1. Softcapped CE backward -> BF16 gradients
     // Scale by 1/(T * GRAD_ACCUM_STEPS) since we normalize loss by T
@@ -1503,6 +1942,9 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                            T, VOCAB_SIZE, n_mtp,
                            SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, 1.0f,
                            ctx->stream);
+
+    BWD_TIMER_END(g_bwd_ce_ms);
+    BWD_TIMER_START();
 
     // 2. lm_head backward via BF16 matmul
     // grad_x = grad_logits @ lm_head.T  (= [T,V] @ [V,D] = [T,D])
@@ -1531,29 +1973,19 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     // Per-layer window sizes and attention scale (mirrors forward_pass setup)
     int bm_sizes[NUM_LAYERS] = {ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, 0,
                                  ws_short, ws_short, ws_short, ws_long};
+    int paired_layers_bk[] = {0, 2, 5, 9};
+    int is_paired_layer[NUM_LAYERS] = {};
+    for (int j = 0; j < 4; j++) is_paired_layer[paired_layers_bk[j]] = 1;
     float attn_scale_val = g_yarn.attn_scale;
 
-    // Compute num_seqs from cum_seqlens
-    int32_t h_cum_sl_bk[4096];
-    int num_seqs = 0;
-    CUDA_CHECK(cudaMemcpy(h_cum_sl_bk, cum_seqlens, (T / 300 + 128) * sizeof(int32_t), cudaMemcpyDeviceToHost));
-    for (int s = 1; s < T / 300 + 128; s++) {
-        if (h_cum_sl_bk[s] >= T) { num_seqs = s; break; }
-    }
-    if (num_seqs == 0) num_seqs = 1;
-
-    bf16 h_scalars[32];
-    CUDA_CHECK(cudaMemcpy(h_scalars, p->scalars, (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyDeviceToHost));
+    // Use cached scalars (no D2H copies needed)
+    const bf16* h_scalars = cs->scalars;
     float backout_lambda = __bfloat162float(h_scalars[2 * NUM_LAYERS + 1]);
 
-    bf16 h_resid[NUM_LAYERS * 2];
-    bf16 h_post_lambdas[NUM_LAYERS * 4];
-    bf16 h_x0_lambdas[NUM_LAYERS];
-    bf16 h_bigram_lambdas[NUM_LAYERS];
-    CUDA_CHECK(cudaMemcpy(h_resid, p->resid_lambdas, sizeof(h_resid), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_post_lambdas, p->post_lambdas, sizeof(h_post_lambdas), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_x0_lambdas, p->x0_lambdas, sizeof(h_x0_lambdas), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_bigram_lambdas, p->bigram_lambdas, sizeof(h_bigram_lambdas), cudaMemcpyDeviceToHost));
+    const bf16* h_resid = cs->resid_lambdas;
+    const bf16* h_post_lambdas = cs->post_lambdas;
+    const bf16* h_x0_lambdas = cs->x0_lambdas;
+    const bf16* h_bigram_lambdas = cs->bigram_lambdas;
 
     // Backout backward: grad_x_backout contribution
     // Forward: x -= backout_lambda * x_backout
@@ -1585,6 +2017,9 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     bf16_dot_product(scalar_grad_acc + 88, act->grad_x, act->x_backout, T * D, ctx->stream);
 
 
+
+    BWD_TIMER_END(g_bwd_lmhead_ms);
+    BWD_TIMER_START();
 
     // 5. Per-layer backward (reverse order 10→0)
     int attn_bank_idx = NUM_ATTN_LAYERS - 1;  // starts at 9 (layer 10 is last attn layer)
@@ -1749,7 +2184,8 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 attention_backward(ctx, attn_bank_idx, act->grad_lane0, grad_normed_attn,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
-                                  T, bm_sizes[i], attn_scale_val);
+                                  T, bm_sizes[i], train_max_seq_len,
+                                  is_paired_layer[i], attn_scale_val);
 
                 // RMS norm backward for attention input
                 rms_norm_bwd(grad_normed_attn, grad_normed_attn, act->saved_lane0[i], T, D, ctx->stream);
@@ -1840,7 +2276,8 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
                 attention_backward(ctx, attn_bank_idx, grad_attn, grad_normed_attn,
                                   qkvo_w, sa_lambda0, sa_lambda1, g_attn,
                                   act->saved_normed[i], cum_seqlens, num_seqs,
-                                  T, bm_sizes[i], attn_scale_val);
+                                  T, bm_sizes[i], train_max_seq_len,
+                                  is_paired_layer[i], attn_scale_val);
 
                 // RMS norm backward for attention input (lane0)
                 rms_norm_bwd(grad_normed_attn, grad_normed_attn, act->saved_lane0[i], T, D, ctx->stream);
@@ -1858,6 +2295,9 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
         }
     }
 
+    BWD_TIMER_END(g_bwd_layers_ms);
+    BWD_TIMER_START();
+
     // 6. Embedding backward
     // grad through x0 -> rms_norm backward -> grad_x
     rms_norm_bwd(grad_x0, grad_x0, act->x, T, D, ctx->stream);
@@ -1868,59 +2308,19 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     // scatter-add into bigram_embed gradient
     scatter_add_embed(g->bigram_embed, grad_x0_bigram, bigram_inputs, T, D, ctx->stream);
 
-    // 7. Copy scalar gradient accumulators into gradient buffers
+    BWD_TIMER_END(g_bwd_embed_ms);
+    BWD_TIMER_START();
+
+    // 7. Accumulate scalar gradient accumulators into gradient buffers (GPU-side)
     // scalar_grad_acc layout: [0..10] resid_attn, [11..21] resid_mlp,
     //   [22..32] x0_lambda, [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
-    {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        float h_sg[89];
-        CUDA_CHECK(cudaMemcpy(h_sg, scalar_grad_acc, 89 * sizeof(float), cudaMemcpyDeviceToHost));
+    accumulate_scalar_grads(g->resid_lambdas, g->x0_lambdas, g->bigram_lambdas,
+                            g->post_lambdas, g->scalars,
+                            scalar_grad_acc, NUM_LAYERS, ctx->stream);
 
-        // resid_lambdas gradient: g->resid_lambdas[i*2+0] += resid_attn, g->resid_lambdas[i*2+1] += resid_mlp
-        bf16 h_resid_grad[NUM_LAYERS * 2];
-        CUDA_CHECK(cudaMemcpy(h_resid_grad, g->resid_lambdas, sizeof(h_resid_grad), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            h_resid_grad[i * 2 + 0] = __float2bfloat16(__bfloat162float(h_resid_grad[i * 2 + 0]) + h_sg[0 + i]);
-            h_resid_grad[i * 2 + 1] = __float2bfloat16(__bfloat162float(h_resid_grad[i * 2 + 1]) + h_sg[11 + i]);
-        }
-        CUDA_CHECK(cudaMemcpy(g->resid_lambdas, h_resid_grad, sizeof(h_resid_grad), cudaMemcpyHostToDevice));
-
-        // x0_lambdas gradient
-        bf16 h_x0g[NUM_LAYERS];
-        CUDA_CHECK(cudaMemcpy(h_x0g, g->x0_lambdas, sizeof(h_x0g), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            h_x0g[i] = __float2bfloat16(__bfloat162float(h_x0g[i]) + h_sg[22 + i]);
-        }
-        CUDA_CHECK(cudaMemcpy(g->x0_lambdas, h_x0g, sizeof(h_x0g), cudaMemcpyHostToDevice));
-
-        // bigram_lambdas gradient
-        bf16 h_bg[NUM_LAYERS];
-        CUDA_CHECK(cudaMemcpy(h_bg, g->bigram_lambdas, sizeof(h_bg), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            h_bg[i] = __float2bfloat16(__bfloat162float(h_bg[i]) + h_sg[33 + i]);
-        }
-        CUDA_CHECK(cudaMemcpy(g->bigram_lambdas, h_bg, sizeof(h_bg), cudaMemcpyHostToDevice));
-
-        // post_lambdas gradient
-        bf16 h_plg[NUM_LAYERS * 4];
-        CUDA_CHECK(cudaMemcpy(h_plg, g->post_lambdas, sizeof(h_plg), cudaMemcpyDeviceToHost));
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            for (int j = 0; j < 4; j++) {
-                h_plg[i * 4 + j] = __float2bfloat16(__bfloat162float(h_plg[i * 4 + j]) + h_sg[44 + i * 4 + j]);
-            }
-        }
-        CUDA_CHECK(cudaMemcpy(g->post_lambdas, h_plg, sizeof(h_plg), cudaMemcpyHostToDevice));
-
-        // backout_lambda gradient -> g->scalars[2*NUM_LAYERS + 1]
-        // Forward: x -= backout_lambda * x_backout, so grad is negated
-        {
-            bf16 h_scalars_grad[2 * NUM_LAYERS + 3];
-            CUDA_CHECK(cudaMemcpy(h_scalars_grad, g->scalars, (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyDeviceToHost));
-            float cur = __bfloat162float(h_scalars_grad[2 * NUM_LAYERS + 1]);
-            h_scalars_grad[2 * NUM_LAYERS + 1] = __float2bfloat16(cur - h_sg[88]);  // negate: forward was subtraction
-            CUDA_CHECK(cudaMemcpy(g->scalars, h_scalars_grad, (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyHostToDevice));
-        }
-    }
+    BWD_TIMER_END(g_bwd_scalgrad_ms);
+    #undef BWD_TIMER_START
+    #undef BWD_TIMER_END
 }
 
 // ============================================================================
@@ -2404,6 +2804,8 @@ static void get_mtp_weights(int step, float* weights, int* n_weights) {
 
 void init_training_context(TrainingContext* ctx) {
     memset(ctx, 0, sizeof(*ctx));
+    // Reconstruct the C++ unordered_map after memset (which corrupts it)
+    new (&ctx->cudnn_graph_cache) CudnnGraphCache();
 
     CUDA_CHECK(cudaSetDevice(0));
     CUDA_CHECK(cudaStreamCreate(&ctx->stream));
@@ -2574,6 +2976,19 @@ int main(int argc, char** argv) {
 
             // Validation: run forward passes over VAL_TOKENS
             {
+                // Cache scalars for validation forward passes
+                CachedScalars val_cached_scalars;
+                CUDA_CHECK(cudaMemcpy(val_cached_scalars.scalars, ctx.params.scalars,
+                                      (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(val_cached_scalars.resid_lambdas, ctx.params.resid_lambdas,
+                                      sizeof(val_cached_scalars.resid_lambdas), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(val_cached_scalars.post_lambdas, ctx.params.post_lambdas,
+                                      sizeof(val_cached_scalars.post_lambdas), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(val_cached_scalars.x0_lambdas, ctx.params.x0_lambdas,
+                                      sizeof(val_cached_scalars.x0_lambdas), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(val_cached_scalars.bigram_lambdas, ctx.params.bigram_lambdas,
+                                      sizeof(val_cached_scalars.bigram_lambdas), cudaMemcpyDeviceToHost));
+
                 float val_loss_sum = 0.0f;
                 int val_tokens_seen = 0;
                 int val_batch = max_tokens;  // Use training-sized chunks (49152) to fit in GPU memory
@@ -2585,10 +3000,12 @@ int main(int argc, char** argv) {
 
                 fprintf(stderr, "  val: batch=%d, val_tokens=%d\n", val_batch, VAL_TOKENS);
                 while (val_tokens_seen < VAL_TOKENS) {
+                    int val_num_seqs = 0;
                     int got = construct_aligned_batch(
                         val_shard.tokens, val_shard.num_tokens,
                         val_bos_pos, val_num_bos, &val_bos_idx,
-                        val_batch, 2048, h_batch, h_cum_lengths, val_batch / 300 + 128);
+                        val_batch, 2048, h_batch, h_cum_lengths, val_batch / 300 + 128,
+                        &val_num_seqs);
                     fprintf(stderr, "  val batch: got=%d, seen=%d\n", got, val_tokens_seen);
 
                     if (got < 0) {
@@ -2605,6 +3022,11 @@ int main(int argc, char** argv) {
                     }
 
                     int T_val = val_batch;
+                    // Pad cum_lengths for cuDNN graph bucketing
+                    int val_bucketed = bucket_num_seqs(val_num_seqs);
+                    for (int j = val_num_seqs + 1; j <= val_bucketed; j++) {
+                        h_cum_lengths[j] = T_val;
+                    }
                     // Convert and upload
                     {
                         int32_t* h_inputs = (int32_t*)malloc(T_val * sizeof(int32_t));
@@ -2625,7 +3047,7 @@ int main(int argc, char** argv) {
                     float eval_mtp[1] = {1.0f};
                     fprintf(stderr, "  val forward_pass (T=%d)...\n", T_val);
                     forward_pass(&ctx, d_inputs, d_targets, d_cum_seqlens, d_bigram_inputs,
-                                T_val, eval_mtp, 1,
+                                T_val, val_num_seqs, &val_cached_scalars, eval_mtp, 1,
                                 ws_short, ws_long, 2048,
                                 0, &loss);
                     fprintf(stderr, "  val forward done, loss=%f\n", loss);
@@ -2651,21 +3073,39 @@ int main(int argc, char** argv) {
         if (last_step) break;
 
         // ---- Training step ----
+        ctx.current_step = step;
         float mtp_weights[3];
         int n_mtp;
         get_mtp_weights(step, mtp_weights, &n_mtp);
 
         zero_grads(&ctx.grads, ctx.stream);
 
-        for (int accum = 0; accum < GRAD_ACCUM_STEPS; accum++) {
-            int num_tokens_local = batch_size / GRAD_ACCUM_STEPS;
+        // Cache all scalar parameters from GPU once per step (constant across microsteps)
+        CachedScalars cached_scalars;
+        CUDA_CHECK(cudaMemcpy(cached_scalars.scalars, ctx.params.scalars,
+                              (2 * NUM_LAYERS + 3) * sizeof(bf16), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cached_scalars.resid_lambdas, ctx.params.resid_lambdas,
+                              sizeof(cached_scalars.resid_lambdas), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cached_scalars.post_lambdas, ctx.params.post_lambdas,
+                              sizeof(cached_scalars.post_lambdas), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cached_scalars.x0_lambdas, ctx.params.x0_lambdas,
+                              sizeof(cached_scalars.x0_lambdas), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cached_scalars.bigram_lambdas, ctx.params.bigram_lambdas,
+                              sizeof(cached_scalars.bigram_lambdas), cudaMemcpyDeviceToHost));
 
+        int num_tokens_local = batch_size / GRAD_ACCUM_STEPS;
+        int32_t* h_inputs = (int32_t*)malloc(num_tokens_local * sizeof(int32_t));
+        int64_t* h_targets = (int64_t*)malloc(num_tokens_local * sizeof(int64_t));
+
+        for (int accum = 0; accum < GRAD_ACCUM_STEPS; accum++) {
             // Construct batch
+            int train_num_seqs = 0;
             int got = construct_aligned_batch(
                 train_shard.tokens, train_shard.num_tokens,
                 bos_positions, num_bos, &bos_idx,
                 num_tokens_local, train_max_seq_len,
-                h_batch, h_cum_lengths, num_tokens_local / 300 + 128);
+                h_batch, h_cum_lengths, num_tokens_local / 300 + 128,
+                &train_num_seqs);
 
             if (got < 0) {
                 // Load next shard
@@ -2684,19 +3124,19 @@ int main(int argc, char** argv) {
 
             int T = num_tokens_local;
 
-            // Convert to int32 inputs and int64 targets, upload to GPU
-            {
-                int32_t* h_inputs = (int32_t*)malloc(T * sizeof(int32_t));
-                int64_t* h_targets = (int64_t*)malloc(T * sizeof(int64_t));
-                for (int i = 0; i < T; i++) {
-                    h_inputs[i] = (int32_t)h_batch[i];
-                    h_targets[i] = (int64_t)h_batch[i + 1];
-                }
-                CUDA_CHECK(cudaMemcpyAsync(d_inputs, h_inputs, T * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream));
-                CUDA_CHECK(cudaMemcpyAsync(d_targets, h_targets, T * sizeof(int64_t), cudaMemcpyHostToDevice, ctx.stream));
-                free(h_inputs);
-                free(h_targets);
+            // Pad cum_lengths for cuDNN graph caching (bucket num_seqs to power of 2)
+            int bucketed_seqs = bucket_num_seqs(train_num_seqs);
+            for (int i = train_num_seqs + 1; i <= bucketed_seqs; i++) {
+                h_cum_lengths[i] = T;  // padded sequences start at end of data (zero length)
             }
+
+            // Convert to int32 inputs and int64 targets, upload to GPU
+            for (int i = 0; i < T; i++) {
+                h_inputs[i] = (int32_t)h_batch[i];
+                h_targets[i] = (int64_t)h_batch[i + 1];
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_inputs, h_inputs, T * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_targets, h_targets, T * sizeof(int64_t), cudaMemcpyHostToDevice, ctx.stream));
 
             // Compute bigram hash on GPU
             bigram_hash(d_bigram_inputs, d_inputs, T, ctx.stream);
@@ -2704,19 +3144,22 @@ int main(int argc, char** argv) {
             // Upload cum_lengths
             CUDA_CHECK(cudaMemcpyAsync(d_cum_seqlens, h_cum_lengths, (T / 300 + 128) * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream));
 
-            // Forward pass
-            float loss;
+            // Forward pass (only compute loss for first microstep)
+            float loss = 0.0f;
             forward_pass(&ctx, d_inputs, d_targets, d_cum_seqlens, d_bigram_inputs,
-                        T, mtp_weights, n_mtp,
+                        T, train_num_seqs, &cached_scalars, mtp_weights, n_mtp,
                         ws_short, ws_long, train_max_seq_len,
-                        1, &loss);
-            if (accum == 0) train_loss = loss;  // capture first micro-batch loss
+                        1, (accum == 0) ? &loss : NULL);
+            if (accum == 0) train_loss = loss;
 
             // Backward pass
             backward_pass(&ctx, d_inputs, d_targets, d_cum_seqlens, d_bigram_inputs,
-                         T, mtp_weights, n_mtp,
+                         T, train_num_seqs, &cached_scalars, mtp_weights, n_mtp,
                          ws_short, ws_long, train_max_seq_len);
         }
+
+        free(h_inputs);
+        free(h_targets);
 
         // Optimizer step
         int do_adam = (step % 2 == 1);

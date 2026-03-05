@@ -9,7 +9,10 @@
 #include <cublasLt.h>
 #include <curand.h>
 #include <cudnn.h>
+#include <cudnn_frontend.h>
 #include <stdint.h>
+#include <unordered_map>
+#include <memory>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -304,10 +307,17 @@ typedef struct {
     bf16* grad_x0;              // accumulated gradient for x0 embedding
     bf16* grad_x0_bigram;       // accumulated gradient for bigram embedding
 
-    // Float accumulators for naive attention backward [T, H, HD] each
-    float* attn_bwd_dQ_f32;
-    float* attn_bwd_dK_f32;
-    float* attn_bwd_dV_f32;
+    // cuDNN flash attention stats (log-sum-exp from forward, needed by backward)
+    // Shape: [num_seqs, attn_H, s_max, 1] per attention layer
+    float* attn_stats[NUM_ATTN_LAYERS];
+
+    // Per-layer saved info for backward (set during forward)
+    int saved_is_paired[NUM_ATTN_LAYERS];
+    int saved_num_seqs;
+
+    // cuDNN ragged offset scratch buffers
+    int32_t* cu_seqlens_paired;   // ragged offsets (element offsets, not token counts)
+    int32_t* seq_len_scratch;     // per-sequence lengths for padding mask [num_seqs]
 
     // cuDNN attention workspace
     void* attn_workspace;
@@ -342,8 +352,53 @@ typedef struct {
     float duration;             // fraction of scheduled iterations
 } TrainingStageConfig;
 
+// cuDNN Frontend graph cache for flash attention
+namespace fe = cudnn_frontend;
+
+struct CudnnGraphCache {
+    struct Key {
+        int num_seqs, attn_H, s_max, window_left;
+        float attn_scale;
+        bool is_backward;
+        bool operator==(const Key& o) const {
+            return num_seqs == o.num_seqs && attn_H == o.attn_H &&
+                   s_max == o.s_max && window_left == o.window_left &&
+                   attn_scale == o.attn_scale && is_backward == o.is_backward;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            size_t h = 0;
+            h ^= std::hash<int>()(k.num_seqs) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.attn_H) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.s_max) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>()(k.window_left) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<float>()(k.attn_scale) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<bool>()(k.is_backward) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    std::unordered_map<Key, std::shared_ptr<fe::graph::Graph>, KeyHash> cache;
+};
+
+// Tensor UIDs for cuDNN variant pack
+enum CudnnTensorUID {
+    UID_Q = 1, UID_K, UID_V, UID_O, UID_DO, UID_STATS,
+    UID_DQ, UID_DK, UID_DV, UID_SEQ_Q, UID_SEQ_KV,
+    UID_SEQ_LEN_Q, UID_SEQ_LEN_KV
+};
+
+// Cached host-side copies of scalar parameters (constant across microsteps)
+struct CachedScalars {
+    bf16 scalars[2 * NUM_LAYERS + 3];
+    bf16 resid_lambdas[NUM_LAYERS * 2];
+    bf16 post_lambdas[NUM_LAYERS * 4];
+    bf16 x0_lambdas[NUM_LAYERS];
+    bf16 bigram_lambdas[NUM_LAYERS];
+};
+
 // Overall training state
-typedef struct {
+struct TrainingContext {
     // Handles
     cublasHandle_t cublas_handle;
     cublasLtHandle_t cublaslt_handle;
@@ -373,7 +428,10 @@ typedef struct {
 
     // Timing
     double training_time_ms;
-} TrainingContext;
+
+    // cuDNN flash attention graph cache
+    CudnnGraphCache cudnn_graph_cache;
+};
 
 // ============================================================================
 // Forward declarations (implemented in train_gpt.cu)

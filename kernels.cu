@@ -73,9 +73,18 @@ __global__ void rms_norm_fwd_kernel(bf16* __restrict__ out,
     const bf16* x_row = x + row * cols;
     bf16* out_row = out + row * cols;
 
-    // Compute sum of squares
+    // Vectorized sum of squares (4 bf16 per iteration via float2 loads)
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    int cols4 = cols & ~3;  // round down to multiple of 4
+    for (int i = threadIdx.x * 4; i < cols4; i += blockDim.x * 4) {
+        float2 v = *(const float2*)(x_row + i);
+        bf16* vp = (bf16*)&v;
+        float v0 = bf16_to_f(vp[0]), v1 = bf16_to_f(vp[1]);
+        float v2 = bf16_to_f(vp[2]), v3 = bf16_to_f(vp[3]);
+        sum_sq += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+    }
+    // Handle remainder
+    for (int i = cols4 + threadIdx.x; i < cols; i += blockDim.x) {
         float val = bf16_to_f(x_row[i]);
         sum_sq += val * val;
     }
@@ -88,17 +97,31 @@ __global__ void rms_norm_fwd_kernel(bf16* __restrict__ out,
     __syncthreads();
     float rms = s_rms;
 
-    // Normalize
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float val = bf16_to_f(x_row[i]);
-        out_row[i] = f_to_bf16(val * rms);
+    // Vectorized normalize
+    for (int i = threadIdx.x * 4; i < cols4; i += blockDim.x * 4) {
+        float2 v = *(const float2*)(x_row + i);
+        bf16* vp = (bf16*)&v;
+        float2 r;
+        bf16* rp = (bf16*)&r;
+        rp[0] = f_to_bf16(bf16_to_f(vp[0]) * rms);
+        rp[1] = f_to_bf16(bf16_to_f(vp[1]) * rms);
+        rp[2] = f_to_bf16(bf16_to_f(vp[2]) * rms);
+        rp[3] = f_to_bf16(bf16_to_f(vp[3]) * rms);
+        *(float2*)(out_row + i) = r;
+    }
+    for (int i = cols4 + threadIdx.x; i < cols; i += blockDim.x) {
+        out_row[i] = f_to_bf16(bf16_to_f(x_row[i]) * rms);
     }
 }
 
 void rms_norm_fwd(bf16* out, const bf16* x, int rows, int cols, cudaStream_t stream) {
-    int threads = min(1024, cdiv(cols, 1) );
-    // Use at least enough threads to cover cols
-    threads = min(1024, max(256, (cols + 31) / 32 * 32));
+    // For small cols (QK norm, cols=128): fewer threads, matched to cols/4
+    int threads;
+    if (cols <= 128) {
+        threads = max(32, (cols / 4 + 31) / 32 * 32);
+    } else {
+        threads = min(1024, max(128, (cols / 4 + 31) / 32 * 32));
+    }
     rms_norm_fwd_kernel<<<rows, threads, 0, stream>>>(out, x, cols);
 }
 
@@ -110,10 +133,18 @@ __global__ void rms_norm_bwd_kernel(bf16* __restrict__ grad_x,
     const bf16* x_row = x + row * cols;
     const bf16* go_row = grad_out + row * cols;
     bf16* gx_row = grad_x + row * cols;
+    int cols4 = cols & ~3;
 
-    // Compute rms
+    // Vectorized sum of squares
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    for (int i = threadIdx.x * 4; i < cols4; i += blockDim.x * 4) {
+        float2 v = *(const float2*)(x_row + i);
+        bf16* vp = (bf16*)&v;
+        float v0 = bf16_to_f(vp[0]), v1 = bf16_to_f(vp[1]);
+        float v2 = bf16_to_f(vp[2]), v3 = bf16_to_f(vp[3]);
+        sum_sq += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+    }
+    for (int i = cols4 + threadIdx.x; i < cols; i += blockDim.x) {
         float val = bf16_to_f(x_row[i]);
         sum_sq += val * val;
     }
@@ -126,12 +157,20 @@ __global__ void rms_norm_bwd_kernel(bf16* __restrict__ grad_x,
     __syncthreads();
     float rms_inv = s_rms_inv;
 
-    // Compute dot product of grad_out and normed_x
+    // Vectorized dot product
     float dot = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float xi = bf16_to_f(x_row[i]);
-        float gi = bf16_to_f(go_row[i]);
-        dot += gi * xi * rms_inv;
+    for (int i = threadIdx.x * 4; i < cols4; i += blockDim.x * 4) {
+        float2 xv = *(const float2*)(x_row + i);
+        float2 gv = *(const float2*)(go_row + i);
+        bf16* xp = (bf16*)&xv;
+        bf16* gp = (bf16*)&gv;
+        dot += bf16_to_f(gp[0]) * bf16_to_f(xp[0]) * rms_inv;
+        dot += bf16_to_f(gp[1]) * bf16_to_f(xp[1]) * rms_inv;
+        dot += bf16_to_f(gp[2]) * bf16_to_f(xp[2]) * rms_inv;
+        dot += bf16_to_f(gp[3]) * bf16_to_f(xp[3]) * rms_inv;
+    }
+    for (int i = cols4 + threadIdx.x; i < cols; i += blockDim.x) {
+        dot += bf16_to_f(go_row[i]) * bf16_to_f(x_row[i]) * rms_inv;
     }
     dot = block_reduce_sum(dot);
 
@@ -142,18 +181,38 @@ __global__ void rms_norm_bwd_kernel(bf16* __restrict__ grad_x,
     __syncthreads();
     float dot_avg = s_dot;
 
-    // Compute gradient
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    // Vectorized gradient computation
+    for (int i = threadIdx.x * 4; i < cols4; i += blockDim.x * 4) {
+        float2 xv = *(const float2*)(x_row + i);
+        float2 gv = *(const float2*)(go_row + i);
+        bf16* xp = (bf16*)&xv;
+        bf16* gp = (bf16*)&gv;
+        float2 r;
+        bf16* rp = (bf16*)&r;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float xi = bf16_to_f(xp[j]);
+            float gi = bf16_to_f(gp[j]);
+            float normed = xi * rms_inv;
+            rp[j] = f_to_bf16(rms_inv * (gi - normed * dot_avg));
+        }
+        *(float2*)(gx_row + i) = r;
+    }
+    for (int i = cols4 + threadIdx.x; i < cols; i += blockDim.x) {
         float xi = bf16_to_f(x_row[i]);
         float gi = bf16_to_f(go_row[i]);
         float normed = xi * rms_inv;
-        float gx = rms_inv * (gi - normed * dot_avg);
-        gx_row[i] = f_to_bf16(gx);
+        gx_row[i] = f_to_bf16(rms_inv * (gi - normed * dot_avg));
     }
 }
 
 void rms_norm_bwd(bf16* grad_x, const bf16* grad_out, const bf16* x, int rows, int cols, cudaStream_t stream) {
-    int threads = min(1024, max(256, (cols + 31) / 32 * 32));
+    int threads;
+    if (cols <= 128) {
+        threads = max(32, (cols / 4 + 31) / 32 * 32);
+    } else {
+        threads = min(1024, max(128, (cols / 4 + 31) / 32 * 32));
+    }
     rms_norm_bwd_kernel<<<rows, threads, 0, stream>>>(grad_x, grad_out, x, cols);
 }
 
@@ -512,15 +571,29 @@ void linear_relu_square_fwd(const bf16* x, const bf16* W1, bf16* pre, bf16* post
 // Pure relu² activation: post[i] = max(pre[i], 0)^2
 __global__ void relu_square_fwd_kernel(const bf16* __restrict__ pre,
                                         bf16* __restrict__ post, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    float val = fmaxf(bf16_to_f(pre[idx]), 0.0f);
-    post[idx] = f_to_bf16(val * val);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < n) {
+        float4 pv = *(const float4*)(pre + idx);
+        bf16* pp = (bf16*)&pv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float val = fmaxf(bf16_to_f(pp[i]), 0.0f);
+            op[i] = f_to_bf16(val * val);
+        }
+        *(float4*)(post + idx) = ov;
+    } else {
+        for (int i = idx; i < n; i++) {
+            float val = fmaxf(bf16_to_f(pre[i]), 0.0f);
+            post[i] = f_to_bf16(val * val);
+        }
+    }
 }
 
 void relu_square_fwd(const bf16* pre, bf16* post, int n, cudaStream_t stream) {
     int threads = 256;
-    relu_square_fwd_kernel<<<cdiv(n, threads), threads, 0, stream>>>(pre, post, n);
+    relu_square_fwd_kernel<<<cdiv(n, threads * 8), threads, 0, stream>>>(pre, post, n);
 }
 
 // Backward: grad_input = 2 * grad * relu_mask(pre) * pre
@@ -528,21 +601,33 @@ __global__ void linear_relu_square_bwd_kernel(const bf16* __restrict__ grad_out,
                                               const bf16* __restrict__ pre,
                                               bf16* __restrict__ out,
                                               int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    float g = bf16_to_f(grad_out[idx]);
-    float p = bf16_to_f(pre[idx]);
-    // d/dx [relu(x)²] = 2 * relu(x) * (x > 0) = 2 * max(x, 0) * (x > 0) = 2 * max(x, 0)
-    float relu_val = fmaxf(p, 0.0f);
-    out[idx] = f_to_bf16(2.0f * g * relu_val);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < n) {
+        float4 gv = *(const float4*)(grad_out + idx);
+        float4 pv = *(const float4*)(pre + idx);
+        bf16* gp = (bf16*)&gv;
+        bf16* pp = (bf16*)&pv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float relu_val = fmaxf(bf16_to_f(pp[i]), 0.0f);
+            op[i] = f_to_bf16(2.0f * bf16_to_f(gp[i]) * relu_val);
+        }
+        *(float4*)(out + idx) = ov;
+    } else {
+        for (int i = idx; i < n; i++) {
+            float relu_val = fmaxf(bf16_to_f(pre[i]), 0.0f);
+            out[i] = f_to_bf16(2.0f * bf16_to_f(grad_out[i]) * relu_val);
+        }
+    }
 }
 
 void linear_relu_square_bwd(const bf16* grad_out, const bf16* pre, bf16* out,
                             int M, int N, cudaStream_t stream) {
     int n = M * N;
     int threads = 256;
-    linear_relu_square_bwd_kernel<<<cdiv(n, threads), threads, 0, stream>>>(grad_out, pre, out, n);
+    linear_relu_square_bwd_kernel<<<cdiv(n, threads * 8), threads, 0, stream>>>(grad_out, pre, out, n);
 }
 
 // ============================================================================
@@ -562,15 +647,23 @@ __global__ void softcapped_ce_fwd_kernel(const bf16* __restrict__ logits,
     const bf16* logits_row = logits + (int64_t)row * n_cols;
     float inv_C = 1.0f / C_val;
     float B_div_C = B * inv_C;
+    int n_cols4 = n_cols & ~3;
 
-    // Pass 1: compute log-sum-exp
+    // Pass 1: compute log-sum-exp (vectorized)
     float max_val = -FLT_MAX;
-    for (int col = threadIdx.x; col < n_cols; col += blockDim.x) {
-        float val = bf16_to_f(logits_row[col]);
-        float u = val * inv_C + B_div_C;
-        float sigmoid_u = 1.0f / (1.0f + expf(-u));
-        float z = A * sigmoid_u;
-        max_val = fmaxf(max_val, z);
+    for (int col = threadIdx.x * 4; col < n_cols4; col += blockDim.x * 4) {
+        float2 v = *(const float2*)(logits_row + col);
+        bf16* vp = (bf16*)&v;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float u = bf16_to_f(vp[i]) * inv_C + B_div_C;
+            float z = A / (1.0f + expf(-u));
+            max_val = fmaxf(max_val, z);
+        }
+    }
+    for (int col = n_cols4 + threadIdx.x; col < n_cols; col += blockDim.x) {
+        float u = bf16_to_f(logits_row[col]) * inv_C + B_div_C;
+        max_val = fmaxf(max_val, A / (1.0f + expf(-u)));
     }
     max_val = block_reduce_max(max_val);
 
@@ -580,12 +673,19 @@ __global__ void softcapped_ce_fwd_kernel(const bf16* __restrict__ logits,
     max_val = s_max;
 
     float sum_exp = 0.0f;
-    for (int col = threadIdx.x; col < n_cols; col += blockDim.x) {
-        float val = bf16_to_f(logits_row[col]);
-        float u = val * inv_C + B_div_C;
-        float sigmoid_u = 1.0f / (1.0f + expf(-u));
-        float z = A * sigmoid_u;
-        sum_exp += expf(z - max_val);
+    for (int col = threadIdx.x * 4; col < n_cols4; col += blockDim.x * 4) {
+        float2 v = *(const float2*)(logits_row + col);
+        bf16* vp = (bf16*)&v;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float u = bf16_to_f(vp[i]) * inv_C + B_div_C;
+            float z = A / (1.0f + expf(-u));
+            sum_exp += expf(z - max_val);
+        }
+    }
+    for (int col = n_cols4 + threadIdx.x; col < n_cols; col += blockDim.x) {
+        float u = bf16_to_f(logits_row[col]) * inv_C + B_div_C;
+        sum_exp += expf(A / (1.0f + expf(-u)) - max_val);
     }
     sum_exp = block_reduce_sum(sum_exp);
 
@@ -833,42 +933,40 @@ __global__ void rope_apply_kernel(bf16* __restrict__ x,
                                    const bf16* __restrict__ cos_table,
                                    const bf16* __restrict__ sin_table,
                                    int T, int num_heads, int head_dim) {
-    // Grid: [T, num_heads], Block: [head_dim/2]
+    // Grid: [T], Block: [num_heads * head_dim/2] — process all heads per block
     int t = blockIdx.x;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-    if (t >= T || h >= num_heads || d >= head_dim / 2) return;
+    if (t >= T) return;
 
-    int idx_base = t * num_heads * head_dim + h * head_dim;
+    int half_hd = head_dim / 2;
+    int total_pairs = num_heads * half_hd;
 
-    // x_rot = cos * x + sin * flip(x)
-    // flip pairs: (x[2i], x[2i+1]) -> (x[2i+1], -x[2i]) when sin[2i+1] has negation
-    // Actually the Python does: x_flip = x.view(..., hd//2, 2).flip(-1).view(x.shape)
-    // So x_flip[2i] = x[2i+1], x_flip[2i+1] = x[2i]
-    // Then: out[2i] = cos[2i]*x[2i] + sin[2i]*x[2i+1]
-    //        out[2i+1] = cos[2i+1]*x[2i+1] + sin[2i+1]*x[2i]
-    // And sin has factor2[..., 1::2] *= -1 applied, so sin[2i+1] is negated
+    for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
+        int h = pair / half_hd;
+        int d = pair % half_hd;
 
-    int idx0 = idx_base + 2 * d;
-    int idx1 = idx_base + 2 * d + 1;
+        int idx_base = t * num_heads * head_dim + h * head_dim;
+        int idx0 = idx_base + 2 * d;
+        int idx1 = idx_base + 2 * d + 1;
+        int tab_idx = t * head_dim + 2 * d;
 
-    float x0 = bf16_to_f(x[idx0]);
-    float x1 = bf16_to_f(x[idx1]);
-    float c0 = bf16_to_f(cos_table[t * head_dim + 2 * d]);
-    float c1 = bf16_to_f(cos_table[t * head_dim + 2 * d + 1]);
-    float s0 = bf16_to_f(sin_table[t * head_dim + 2 * d]);
-    float s1 = bf16_to_f(sin_table[t * head_dim + 2 * d + 1]);
+        float x0 = bf16_to_f(x[idx0]);
+        float x1 = bf16_to_f(x[idx1]);
+        float c0 = bf16_to_f(cos_table[tab_idx]);
+        float c1 = bf16_to_f(cos_table[tab_idx + 1]);
+        float s0 = bf16_to_f(sin_table[tab_idx]);
+        float s1 = bf16_to_f(sin_table[tab_idx + 1]);
 
-    // flip: swap x0 and x1
-    x[idx0] = f_to_bf16(c0 * x0 + s0 * x1);
-    x[idx1] = f_to_bf16(c1 * x1 + s1 * x0);
+        x[idx0] = f_to_bf16(c0 * x0 + s0 * x1);
+        x[idx1] = f_to_bf16(c1 * x1 + s1 * x0);
+    }
 }
 
 void rope_apply(bf16* x, const bf16* cos_table, const bf16* sin_table,
                 int T, int num_heads, int head_dim, cudaStream_t stream) {
-    dim3 grid(T, num_heads);
-    dim3 block(head_dim / 2);
-    rope_apply_kernel<<<grid, block, 0, stream>>>(x, cos_table, sin_table, T, num_heads, head_dim);
+    // num_heads * head_dim/2 = 6 * 64 = 384 pairs
+    int total_pairs = num_heads * head_dim / 2;
+    int threads = min(1024, ((total_pairs + 31) / 32) * 32);  // round up to warp
+    rope_apply_kernel<<<T, threads, 0, stream>>>(x, cos_table, sin_table, T, num_heads, head_dim);
 }
 
 // Compute YaRN cos/sin tables
@@ -933,17 +1031,24 @@ __global__ void gather_embed_kernel(bf16* __restrict__ out,
                                      const int32_t* __restrict__ indices,
                                      int num_tokens, int embed_dim) {
     int token = blockIdx.x;
-    int d = threadIdx.x;
-    if (token >= num_tokens || d >= embed_dim) return;
+    if (token >= num_tokens) return;
 
     int idx = indices[token];
-    out[token * embed_dim + d] = embed[idx * embed_dim + d];
+    const bf16* src = embed + idx * embed_dim;
+    bf16* dst = out + token * embed_dim;
+    int dim4 = embed_dim & ~3;
+
+    for (int d = threadIdx.x * 4; d < dim4; d += blockDim.x * 4) {
+        *(float2*)(dst + d) = *(const float2*)(src + d);
+    }
+    for (int d = dim4 + threadIdx.x; d < embed_dim; d += blockDim.x) {
+        dst[d] = src[d];
+    }
 }
 
 void gather_embed(bf16* out, const bf16* embed, const int32_t* indices,
                   int num_tokens, int embed_dim, cudaStream_t stream) {
     dim3 grid(num_tokens);
-    // Use multiple threads per token for large embed_dim
     int threads = min(1024, embed_dim);
     gather_embed_kernel<<<grid, threads, 0, stream>>>(out, embed, indices, num_tokens, embed_dim);
 
@@ -1057,15 +1162,30 @@ __global__ void fused_add_scale_kernel(bf16* __restrict__ out,
                                         const bf16* __restrict__ x,
                                         const bf16* __restrict__ y,
                                         float scale_x, float scale_y, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    out[idx] = f_to_bf16(scale_x * bf16_to_f(x[idx]) + scale_y * bf16_to_f(y[idx]));
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < n) {
+        float4 xv = *(const float4*)(x + idx);
+        float4 yv = *(const float4*)(y + idx);
+        bf16* xp = (bf16*)&xv;
+        bf16* yp = (bf16*)&yv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            op[i] = f_to_bf16(scale_x * bf16_to_f(xp[i]) + scale_y * bf16_to_f(yp[i]));
+        }
+        *(float4*)(out + idx) = ov;
+    } else {
+        for (int i = idx; i < n; i++) {
+            out[i] = f_to_bf16(scale_x * bf16_to_f(x[i]) + scale_y * bf16_to_f(y[i]));
+        }
+    }
 }
 
 void fused_add_scale(bf16* out, const bf16* x, const bf16* y,
                      float scale_x, float scale_y, int n, cudaStream_t stream) {
     int threads = 256;
-    fused_add_scale_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, x, y, scale_x, scale_y, n);
+    fused_add_scale_kernel<<<cdiv(n, threads * 8), threads, 0, stream>>>(out, x, y, scale_x, scale_y, n);
 }
 
 __global__ void fused_add3_kernel(bf16* __restrict__ out,
@@ -1073,15 +1193,32 @@ __global__ void fused_add3_kernel(bf16* __restrict__ out,
                                    const bf16* __restrict__ y,
                                    const bf16* __restrict__ z,
                                    float a, float b, float c, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    out[idx] = f_to_bf16(a * bf16_to_f(x[idx]) + b * bf16_to_f(y[idx]) + c * bf16_to_f(z[idx]));
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < n) {
+        float4 xv = *(const float4*)(x + idx);
+        float4 yv = *(const float4*)(y + idx);
+        float4 zv = *(const float4*)(z + idx);
+        bf16* xp = (bf16*)&xv;
+        bf16* yp = (bf16*)&yv;
+        bf16* zp = (bf16*)&zv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            op[i] = f_to_bf16(a * bf16_to_f(xp[i]) + b * bf16_to_f(yp[i]) + c * bf16_to_f(zp[i]));
+        }
+        *(float4*)(out + idx) = ov;
+    } else {
+        for (int i = idx; i < n; i++) {
+            out[i] = f_to_bf16(a * bf16_to_f(x[i]) + b * bf16_to_f(y[i]) + c * bf16_to_f(z[i]));
+        }
+    }
 }
 
 void fused_add3(bf16* out, const bf16* x, const bf16* y, const bf16* z,
                 float a, float b, float c, int n, cudaStream_t stream) {
     int threads = 256;
-    fused_add3_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, x, y, z, a, b, c, n);
+    fused_add3_kernel<<<cdiv(n, threads * 8), threads, 0, stream>>>(out, x, y, z, a, b, c, n);
 }
 
 // Smear forward: out[0] = x[0], out[i] = x[i] + gate * x[i-1]
@@ -1142,28 +1279,54 @@ __global__ void adam_update_kernel(bf16* __restrict__ param,
                                    float* __restrict__ exp_avg_sq,
                                    float beta1, float beta2, float eps,
                                    float step_size, float eff_wd, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    float g = bf16_to_f(grad[idx]);
-    float ea = exp_avg[idx];
-    float eas = exp_avg_sq[idx];
-    float p = bf16_to_f(param[idx]);
-
-    // Adam update
-    ea = beta1 * ea + (1.0f - beta1) * g;
-    eas = beta2 * eas + (1.0f - beta2) * g * g;
-    float update = ea / (sqrtf(eas) + eps) * step_size;
-
-    // Cautious weight decay
-    float mask = (update * p > 0.0f) ? 1.0f : 0.0f;
-    update += p * mask * eff_wd;
-
-    p -= update;
-
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = eas;
-    param[idx] = f_to_bf16(p);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (idx + 3 < n) {
+        float2 pv = *(const float2*)(param + idx);
+        float2 gv = *(const float2*)(grad + idx);
+        float4 eav = *(const float4*)(exp_avg + idx);
+        float4 easv = *(const float4*)(exp_avg_sq + idx);
+        bf16* pp = (bf16*)&pv;
+        bf16* gp = (bf16*)&gv;
+        float* eap = (float*)&eav;
+        float* easp = (float*)&easv;
+        float2 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float g = bf16_to_f(gp[i]);
+            float ea = eap[i];
+            float eas = easp[i];
+            float p = bf16_to_f(pp[i]);
+            ea = beta1 * ea + (1.0f - beta1) * g;
+            eas = beta2 * eas + (1.0f - beta2) * g * g;
+            float update = ea / (sqrtf(eas) + eps) * step_size;
+            float mask = (update * p > 0.0f) ? 1.0f : 0.0f;
+            update += p * mask * eff_wd;
+            p -= update;
+            eap[i] = ea;
+            easp[i] = eas;
+            op[i] = f_to_bf16(p);
+        }
+        *(float2*)(param + idx) = ov;
+        *(float4*)(exp_avg + idx) = eav;
+        *(float4*)(exp_avg_sq + idx) = easv;
+    } else {
+        for (int i = idx; i < n; i++) {
+            float g = bf16_to_f(grad[i]);
+            float ea = exp_avg[i];
+            float eas = exp_avg_sq[i];
+            float p = bf16_to_f(param[i]);
+            ea = beta1 * ea + (1.0f - beta1) * g;
+            eas = beta2 * eas + (1.0f - beta2) * g * g;
+            float update = ea / (sqrtf(eas) + eps) * step_size;
+            float mask = (update * p > 0.0f) ? 1.0f : 0.0f;
+            update += p * mask * eff_wd;
+            p -= update;
+            exp_avg[i] = ea;
+            exp_avg_sq[i] = eas;
+            param[i] = f_to_bf16(p);
+        }
+    }
 }
 
 void adam_update(bf16* param, const bf16* grad,
@@ -1172,7 +1335,7 @@ void adam_update(bf16* param, const bf16* grad,
                 float step_size, float eff_wd,
                 int numel, cudaStream_t stream) {
     int threads = 256;
-    adam_update_kernel<<<cdiv(numel, threads), threads, 0, stream>>>(
+    adam_update_kernel<<<cdiv(numel, threads * 4), threads, 0, stream>>>(
         param, grad, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size, eff_wd, numel);
 }
 
@@ -1181,34 +1344,51 @@ __global__ void muon_cautious_update_kernel(uint16_t* __restrict__ p,
                                              uint16_t* __restrict__ mantissa,
                                              const bf16* __restrict__ grad,
                                              float eff_wd, float eff_lr, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    float g = bf16_to_f(grad[idx]);
-
-    // Reconstruct FP32 from BF16 upper bits + uint16 mantissa lower bits
-    uint32_t p_upper = (uint32_t)p[idx] << 16;
-    uint32_t p_lower = (uint32_t)mantissa[idx];
-    uint32_t p_bits = p_upper | p_lower;
-    float p_precise;
-    memcpy(&p_precise, &p_bits, sizeof(float));
-
-    // Cautious weight decay: mask = (grad * p_precise) >= 0
-    float mask = (g * p_precise >= 0.0f) ? 1.0f : 0.0f;
-    p_precise = p_precise - (p_precise * mask * eff_wd * eff_lr) - (g * eff_lr);
-
-    // Split back into BF16 + mantissa
-    uint32_t result_bits;
-    memcpy(&result_bits, &p_precise, sizeof(float));
-    p[idx] = (uint16_t)(result_bits >> 16);
-    mantissa[idx] = (uint16_t)(result_bits & 0xFFFF);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (idx + 3 < n) {
+        // Load 4 uint16 pairs + 4 bf16 grads
+        uint2 pv = *(const uint2*)(p + idx);        // 4 x uint16
+        uint2 mv = *(const uint2*)(mantissa + idx);  // 4 x uint16
+        float2 gv = *(const float2*)(grad + idx);    // 4 x bf16
+        uint16_t* pp = (uint16_t*)&pv;
+        uint16_t* mp = (uint16_t*)&mv;
+        bf16* gp = (bf16*)&gv;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float g = bf16_to_f(gp[i]);
+            uint32_t p_bits = ((uint32_t)pp[i] << 16) | (uint32_t)mp[i];
+            float p_precise;
+            memcpy(&p_precise, &p_bits, sizeof(float));
+            float mask = (g * p_precise >= 0.0f) ? 1.0f : 0.0f;
+            p_precise = p_precise - (p_precise * mask * eff_wd * eff_lr) - (g * eff_lr);
+            uint32_t result_bits;
+            memcpy(&result_bits, &p_precise, sizeof(float));
+            pp[i] = (uint16_t)(result_bits >> 16);
+            mp[i] = (uint16_t)(result_bits & 0xFFFF);
+        }
+        *(uint2*)(p + idx) = pv;
+        *(uint2*)(mantissa + idx) = mv;
+    } else {
+        for (int i = idx; i < n; i++) {
+            float g = bf16_to_f(grad[i]);
+            uint32_t p_bits = ((uint32_t)p[i] << 16) | (uint32_t)mantissa[i];
+            float p_precise;
+            memcpy(&p_precise, &p_bits, sizeof(float));
+            float mask = (g * p_precise >= 0.0f) ? 1.0f : 0.0f;
+            p_precise = p_precise - (p_precise * mask * eff_wd * eff_lr) - (g * eff_lr);
+            uint32_t result_bits;
+            memcpy(&result_bits, &p_precise, sizeof(float));
+            p[i] = (uint16_t)(result_bits >> 16);
+            mantissa[i] = (uint16_t)(result_bits & 0xFFFF);
+        }
+    }
 }
 
 void muon_cautious_update(uint16_t* param_u16, uint16_t* mantissa,
                           const bf16* grad, float eff_wd, float eff_lr,
                           int numel, cudaStream_t stream) {
     int threads = 256;
-    muon_cautious_update_kernel<<<cdiv(numel, threads), threads, 0, stream>>>(
+    muon_cautious_update_kernel<<<cdiv(numel, threads * 4), threads, 0, stream>>>(
         param_u16, mantissa, grad, eff_wd, eff_lr, numel);
 }
 
@@ -1349,14 +1529,25 @@ void normuon_variance_reduction(bf16* v_chunk, float* second_momentum_buffer,
 // ============================================================================
 
 __global__ void scale_tensor_kernel(bf16* __restrict__ x, float scale, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    x[idx] = f_to_bf16(bf16_to_f(x[idx]) * scale);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < n) {
+        float4 xv = *(const float4*)(x + idx);
+        bf16* xp = (bf16*)&xv;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            xp[i] = f_to_bf16(bf16_to_f(xp[i]) * scale);
+        }
+        *(float4*)(x + idx) = xv;
+    } else {
+        for (int i = idx; i < n; i++) {
+            x[i] = f_to_bf16(bf16_to_f(x[i]) * scale);
+        }
+    }
 }
 
 void scale_tensor(bf16* x, float scale, int n, cudaStream_t stream) {
     int threads = 256;
-    scale_tensor_kernel<<<cdiv(n, threads), threads, 0, stream>>>(x, scale, n);
+    scale_tensor_kernel<<<cdiv(n, threads * 8), threads, 0, stream>>>(x, scale, n);
 }
 
 // ============================================================================
@@ -1370,8 +1561,17 @@ __global__ void tensor_norm_kernel(const bf16* __restrict__ x, float* __restrict
 
     const bf16* x_mat = x + b * rows * cols;
     float sum_sq = 0.0f;
+    int total = rows * cols;
+    int total4 = total & ~3;
 
-    for (int i = threadIdx.x; i < rows * cols; i += blockDim.x) {
+    for (int i = threadIdx.x * 4; i < total4; i += blockDim.x * 4) {
+        float2 v = *(const float2*)(x_mat + i);
+        bf16* vp = (bf16*)&v;
+        float v0 = bf16_to_f(vp[0]), v1 = bf16_to_f(vp[1]);
+        float v2 = bf16_to_f(vp[2]), v3 = bf16_to_f(vp[3]);
+        sum_sq += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+    }
+    for (int i = total4 + threadIdx.x; i < total; i += blockDim.x) {
         float val = bf16_to_f(x_mat[i]);
         sum_sq += val * val;
     }
@@ -1431,26 +1631,38 @@ __global__ void nesterov_momentum_kernel(bf16* __restrict__ grad_out,
                                           float* __restrict__ buf,
                                           const bf16* __restrict__ grad_in,
                                           float momentum, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    float g = bf16_to_f(grad_in[idx]);
-    float b = buf[idx];
-
-    // buf = momentum * buf + (1-momentum) * g
-    b = momentum * b + (1.0f - momentum) * g;
-    buf[idx] = b;
-
-    // Nesterov lookahead: out = momentum * buf + (1-momentum) * g
-    // = momentum * (momentum*old_buf + (1-m)*g) + (1-m)*g
-    float out = momentum * b + (1.0f - momentum) * g;
-    grad_out[idx] = f_to_bf16(out);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    float one_minus_m = 1.0f - momentum;
+    if (idx + 3 < n) {
+        float2 gv = *(const float2*)(grad_in + idx);
+        float4 bv = *(const float4*)(buf + idx);
+        bf16* gp = (bf16*)&gv;
+        float* bp = (float*)&bv;
+        float2 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float g = bf16_to_f(gp[i]);
+            float b = momentum * bp[i] + one_minus_m * g;
+            bp[i] = b;
+            op[i] = f_to_bf16(momentum * b + one_minus_m * g);
+        }
+        *(float4*)(buf + idx) = bv;
+        *(float2*)(grad_out + idx) = ov;
+    } else {
+        for (int i = idx; i < n; i++) {
+            float g = bf16_to_f(grad_in[i]);
+            float b = momentum * buf[i] + one_minus_m * g;
+            buf[i] = b;
+            grad_out[i] = f_to_bf16(momentum * b + one_minus_m * g);
+        }
+    }
 }
 
 void nesterov_momentum(bf16* grad_out, float* momentum_buffer, const bf16* grad_in,
                        float momentum, int n, cudaStream_t stream) {
     int threads = 256;
-    nesterov_momentum_kernel<<<cdiv(n, threads), threads, 0, stream>>>(
+    nesterov_momentum_kernel<<<cdiv(n, threads * 4), threads, 0, stream>>>(
         grad_out, momentum_buffer, grad_in, momentum, n);
 }
 
@@ -1458,18 +1670,31 @@ void nesterov_momentum(bf16* grad_out, float* momentum_buffer, const bf16* grad_
 __global__ void norm_divide_kernel(bf16* __restrict__ x, const float* __restrict__ norms,
                                     int batch, int elems, float safety, float eps) {
     int b = blockIdx.y;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= batch || idx >= elems) return;
+    int base = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (b >= batch) return;
 
     float scale = 1.0f / (norms[b] * (1.0f + safety) + eps);
-    int offset = b * elems + idx;
-    x[offset] = f_to_bf16(bf16_to_f(x[offset]) * scale);
+    int offset = b * elems + base;
+    if (base + 7 < elems) {
+        float4 xv = *(const float4*)(x + offset);
+        bf16* xp = (bf16*)&xv;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            xp[i] = f_to_bf16(bf16_to_f(xp[i]) * scale);
+        }
+        *(float4*)(x + offset) = xv;
+    } else {
+        for (int i = base; i < elems; i++) {
+            int off = b * elems + i;
+            x[off] = f_to_bf16(bf16_to_f(x[off]) * scale);
+        }
+    }
 }
 
 void norm_divide(bf16* x, const float* norms, int batch, int elems_per_batch,
                  float safety, float eps, cudaStream_t stream) {
     int threads = 256;
-    dim3 grid(cdiv(elems_per_batch, threads), batch);
+    dim3 grid(cdiv(elems_per_batch, threads * 8), batch);
     norm_divide_kernel<<<grid, threads, 0, stream>>>(x, norms, batch, elems_per_batch, safety, eps);
 }
 
@@ -1508,8 +1733,25 @@ __global__ void bf16_dot_product_kernel(float* __restrict__ out,
                                          const bf16* __restrict__ b,
                                          int n) {
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        sum += bf16_to_f(a[i]) * bf16_to_f(b[i]);
+    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    // Process 8 elements per thread per iteration
+    for (int i = global_idx * 8; i + 7 < n; i += stride * 8) {
+        float4 av = *(const float4*)(a + i);
+        float4 bv = *(const float4*)(b + i);
+        bf16* ap = (bf16*)&av;
+        bf16* bp = (bf16*)&bv;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            sum += bf16_to_f(ap[j]) * bf16_to_f(bp[j]);
+        }
+    }
+    // Handle remainder
+    int remainder_start = (n / (stride * 8)) * stride * 8 + global_idx * 8;
+    if (remainder_start < n) {
+        for (int i = remainder_start; i < n; i++) {
+            sum += bf16_to_f(a[i]) * bf16_to_f(b[i]);
+        }
     }
     sum = block_reduce_sum(sum);
     if (threadIdx.x == 0) {
@@ -1518,8 +1760,10 @@ __global__ void bf16_dot_product_kernel(float* __restrict__ out,
 }
 
 void bf16_dot_product(float* out, const bf16* a, const bf16* b, int n, cudaStream_t stream) {
-    int threads = min(1024, n);
-    bf16_dot_product_kernel<<<1, threads, 0, stream>>>(out, a, b, n);
+    int threads = 256;
+    // Use enough blocks to saturate the GPU (each SM can run multiple blocks)
+    int blocks = min(128, cdiv(n, threads * 8));
+    bf16_dot_product_kernel<<<blocks, threads, 0, stream>>>(out, a, b, n);
 }
 
 // ============================================================================
@@ -1532,42 +1776,70 @@ __global__ void elementwise_mul_broadcast_kernel(bf16* __restrict__ out,
                                                   const bf16* __restrict__ gate,
                                                   int total, int inner_dim,
                                                   int gate_stride) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    // Determine which gate element to use
-    // Layout: [T, H, HD] or similar, gate broadcasts over last dim
-    int gate_idx = (idx / inner_dim) % gate_stride;
-    float g = bf16_to_f(gate[gate_idx]);
-    out[idx] = f_to_bf16(bf16_to_f(x[idx]) * g);
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < total) {
+        float4 xv = *(const float4*)(x + idx);
+        bf16* xp = (bf16*)&xv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int gate_idx = ((idx + i) / inner_dim) % gate_stride;
+            float g = bf16_to_f(gate[gate_idx]);
+            op[i] = f_to_bf16(bf16_to_f(xp[i]) * g);
+        }
+        *(float4*)(out + idx) = ov;
+    } else {
+        for (int i = idx; i < total; i++) {
+            int gate_idx = (i / inner_dim) % gate_stride;
+            float g = bf16_to_f(gate[gate_idx]);
+            out[i] = f_to_bf16(bf16_to_f(x[i]) * g);
+        }
+    }
 }
 
 void elementwise_mul_broadcast(bf16* out, const bf16* x, const bf16* gate,
                                int total, int inner_dim, int gate_stride,
                                cudaStream_t stream) {
     int threads = 256;
-    elementwise_mul_broadcast_kernel<<<cdiv(total, threads), threads, 0, stream>>>(
+    elementwise_mul_broadcast_kernel<<<cdiv(total, threads * 8), threads, 0, stream>>>(
         out, x, gate, total, inner_dim, gate_stride);
 }
 
-// Fused gate add: out[i] = x[i] + gate[gate_idx] * y[i]
+/// Fused gate add: out[i] = x[i] + gate[gate_idx] * y[i]
 __global__ void fused_gate_add_kernel(bf16* __restrict__ out,
                                        const bf16* __restrict__ x,
                                        const bf16* __restrict__ gate,
                                        const bf16* __restrict__ y,
                                        int total, int inner_dim, int gate_stride) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    int gate_idx = (idx / inner_dim) % gate_stride;
-    float g = bf16_to_f(gate[gate_idx]);
-    out[idx] = f_to_bf16(bf16_to_f(x[idx]) + g * bf16_to_f(y[idx]));
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx + 7 < total) {
+        float4 xv = *(const float4*)(x + idx);
+        float4 yv = *(const float4*)(y + idx);
+        bf16* xp = (bf16*)&xv;
+        bf16* yp = (bf16*)&yv;
+        float4 ov;
+        bf16* op = (bf16*)&ov;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int gate_idx = ((idx + i) / inner_dim) % gate_stride;
+            float g = bf16_to_f(gate[gate_idx]);
+            op[i] = f_to_bf16(bf16_to_f(xp[i]) + g * bf16_to_f(yp[i]));
+        }
+        *(float4*)(out + idx) = ov;
+    } else {
+        for (int i = idx; i < total; i++) {
+            int gate_idx = (i / inner_dim) % gate_stride;
+            float g = bf16_to_f(gate[gate_idx]);
+            out[i] = f_to_bf16(bf16_to_f(x[i]) + g * bf16_to_f(y[i]));
+        }
+    }
 }
 
 void fused_gate_add(bf16* out, const bf16* x, const bf16* gate, const bf16* y,
                     int total, int inner_dim, int gate_stride, cudaStream_t stream) {
     int threads = 256;
-    fused_gate_add_kernel<<<cdiv(total, threads), threads, 0, stream>>>(
+    fused_gate_add_kernel<<<cdiv(total, threads * 8), threads, 0, stream>>>(
         out, x, gate, y, total, inner_dim, gate_stride);
 }
 
@@ -1960,4 +2232,58 @@ void naive_varlen_attention_backward(
     f32_to_bf16_kernel<<<ngrid, block, 0, stream>>>(dQ, dQ_f32, total_elems);
     f32_to_bf16_kernel<<<ngrid, block, 0, stream>>>(dK, dK_f32, total_elems);
     f32_to_bf16_kernel<<<ngrid, block, 0, stream>>>(dV, dV_f32, total_elems);
+}
+
+// ============================================================================
+// Scalar gradient accumulation (GPU-side)
+// ============================================================================
+
+// acc layout: [0..10] resid_attn, [11..21] resid_mlp, [22..32] x0_lambda,
+//   [33..43] bigram_lambda, [44..87] post_lambdas, [88] backout_lambda
+__global__ void accumulate_scalar_grads_kernel(
+    bf16* resid_grads,       // [num_layers * 2]
+    bf16* x0_grads,          // [num_layers]
+    bf16* bigram_grads,      // [num_layers]
+    bf16* post_lambda_grads, // [num_layers * 4]
+    bf16* scalar_grads,      // [2*num_layers + 3]
+    const float* acc,        // [89] float accumulators
+    int num_layers)
+{
+    int i = threadIdx.x;
+    if (i >= num_layers) return;
+
+    // resid_lambdas: resid_grads[i*2+0] += acc[0+i] (attn), resid_grads[i*2+1] += acc[11+i] (mlp)
+    float r0 = __bfloat162float(resid_grads[i * 2 + 0]) + acc[0 + i];
+    float r1 = __bfloat162float(resid_grads[i * 2 + 1]) + acc[11 + i];
+    resid_grads[i * 2 + 0] = __float2bfloat16(r0);
+    resid_grads[i * 2 + 1] = __float2bfloat16(r1);
+
+    // x0_lambdas: x0_grads[i] += acc[22+i]
+    x0_grads[i] = __float2bfloat16(__bfloat162float(x0_grads[i]) + acc[22 + i]);
+
+    // bigram_lambdas: bigram_grads[i] += acc[33+i]
+    bigram_grads[i] = __float2bfloat16(__bfloat162float(bigram_grads[i]) + acc[33 + i]);
+
+    // post_lambdas: post_lambda_grads[i*4+j] += acc[44+i*4+j]
+    for (int j = 0; j < 4; j++) {
+        float v = __bfloat162float(post_lambda_grads[i * 4 + j]) + acc[44 + i * 4 + j];
+        post_lambda_grads[i * 4 + j] = __float2bfloat16(v);
+    }
+
+    // backout_lambda: scalar_grads[2*num_layers+1] -= acc[88] (negated: forward was subtraction)
+    // Only one thread does this
+    if (i == 0) {
+        int idx = 2 * num_layers + 1;
+        float cur = __bfloat162float(scalar_grads[idx]);
+        scalar_grads[idx] = __float2bfloat16(cur - acc[88]);
+    }
+}
+
+void accumulate_scalar_grads(bf16* resid_grads, bf16* x0_grads, bf16* bigram_grads,
+                             bf16* post_lambda_grads, bf16* scalar_grads,
+                             const float* acc, int num_layers, cudaStream_t stream) {
+    // Single block, num_layers threads (11 threads)
+    accumulate_scalar_grads_kernel<<<1, num_layers, 0, stream>>>(
+        resid_grads, x0_grads, bigram_grads, post_lambda_grads, scalar_grads,
+        acc, num_layers);
 }
