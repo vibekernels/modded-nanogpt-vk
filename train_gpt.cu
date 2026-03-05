@@ -153,184 +153,102 @@ static void gemm_bf16_batched(cublasHandle_t handle,
     ));
 }
 
-// FP8 GEMM via cuBLAS LT: out[M,N] = x_f8[M,K] @ w_f8[K,N]
-// x_f8, w_f8 stored row-major. cuBLAS uses column-major: swap operands.
-// Row-major [R,C] ≡ col-major [C,R] with ld=C.
-static void gemm_fp8_forward(cublasLtHandle_t handle,
-                             const fp8e4m3* x_f8, const fp8e4m3* w_f8,
-                             bf16* out,
-                             int M, int N, int K,
-                             float x_scale, float w_scale,
-                             cudaStream_t stream) {
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+// FP8 workspace for algorithm heuristic (allocated once, reused)
+static void* g_fp8_workspace = NULL;
+static size_t g_fp8_workspace_size = 32 * 1024 * 1024; // 32MB
 
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-
-    // Standard row-major trick: out_cm[N,M] = w_cm[N,K] @ x_cm[K,M]
-    // w_f8 row-major [K,N] → col-major [N,K,ld=N]
-    // x_f8 row-major [M,K] → col-major [K,M,ld=K]
-    // out   row-major [M,N] → col-major [N,M,ld=N]
-    cublasOperation_t transA = CUBLAS_OP_N;
-    cublasOperation_t transB = CUBLAS_OP_N;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E4M3, N, K, N));   // w_f8 cm: [N,K]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E4M3, K, M, K));   // x_f8 cm: [K,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, N, M, N));       // out cm:  [N,M]
-
-    float alpha = x_scale * w_scale;
-    float beta_val = 0.0f;
-
-    CUBLAS_CHECK(cublasLtMatmul(
-        handle, matmulDesc,
-        &alpha,
-        w_f8, Adesc,
-        x_f8, Bdesc,
-        &beta_val,
-        out, Cdesc,
-        out, Cdesc,
-        NULL, NULL, 0, stream
-    ));
-
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-    cublasLtMatmulDescDestroy(matmulDesc);
+static void ensure_fp8_workspace() {
+    if (!g_fp8_workspace) {
+        CUDA_CHECK(cudaMalloc(&g_fp8_workspace, g_fp8_workspace_size));
+    }
 }
 
-// FP8 backward: grad_x[M,K] = grad_f8[M,N] @ w_f8[K,N].T
-// grad_f8 row-major [M,N], w_f8 row-major [K,N], grad_x row-major [M,K]
-static void gemm_fp8_backward_grad_x(cublasLtHandle_t handle,
-                                      const fp8e5m2* grad_f8, const fp8e4m3* w_f8,
-                                      bf16* grad_x,
-                                      int M, int N, int K,
-                                      float grad_scale, float w_scale,
-                                      cudaStream_t stream) {
+// FP8 GEMM helper using TN layout (only layout supported for FP8 on H100).
+// D[m,n] = alpha * A^T[m,k] * B[k,n] + beta * C[m,n]  (all in cuBLAS col-major)
+// A is [k,m] col-major (A^T = [m,k]), B is [k,n] col-major, D is [m,n] col-major.
+static void gemm_fp8_tn(cublasLtHandle_t handle,
+                         const void* A, cudaDataType_t Atype, int k, int m, int A_ld,
+                         const void* B, cudaDataType_t Btype, int Bk, int n, int B_ld,
+                         void* D, cudaDataType_t Dtype, int Dm, int Dn, int D_ld,
+                         float alpha, float beta, bool fast_accum, cudaStream_t stream) {
+    ensure_fp8_workspace();
+
     cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+    cublasLtMatrixLayout_t Adesc, Bdesc, Ddesc;
 
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
 
-    // Row-major trick: grad_x_cm[K,M] = w_cm.T[K,N] @ grad_cm[N,M]
-    // w_f8 rm [K,N] → cm [N,K,ld=N], need transpose → op(A) = [K,N]
-    // grad_f8 rm [M,N] → cm [N,M,ld=N], no transpose → op(B) = [N,M]
-    // grad_x rm [M,K] → cm [K,M,ld=K]
     cublasOperation_t transA = CUBLAS_OP_T;
     cublasOperation_t transB = CUBLAS_OP_N;
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
 
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E4M3, N, K, N));   // w_f8 cm: [N,K]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E5M2, N, M, N));   // grad cm: [N,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, K, M, K));       // grad_x cm: [K,M]
+    if (fast_accum) {
+        int8_t flag = 1;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &flag, sizeof(flag)));
+    }
 
-    float alpha = grad_scale * w_scale;
-    float beta_val = 0.0f;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, Atype, k, m, A_ld));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, Btype, Bk, n, B_ld));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Ddesc, Dtype, Dm, Dn, D_ld));
+
+    // Use heuristic to find optimal algorithm with workspace
+    cublasLtMatmulPreference_t pref;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                       &g_fp8_workspace_size, sizeof(g_fp8_workspace_size)));
+
+    cublasLtMatmulHeuristicResult_t result;
+    int returnedResults = 0;
+    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, matmulDesc, Adesc, Bdesc, Ddesc, Ddesc,
+                                                 pref, 1, &result, &returnedResults));
 
     CUBLAS_CHECK(cublasLtMatmul(
         handle, matmulDesc,
-        &alpha,
-        w_f8, Adesc,
-        grad_f8, Bdesc,
-        &beta_val,
-        grad_x, Cdesc,
-        grad_x, Cdesc,
-        NULL, NULL, 0, stream
+        &alpha, A, Adesc, B, Bdesc,
+        &beta, D, Ddesc, D, Ddesc,
+        &result.algo, g_fp8_workspace, g_fp8_workspace_size, stream
     ));
 
+    cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(Adesc);
     cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
+    cublasLtMatrixLayoutDestroy(Ddesc);
     cublasLtMatmulDescDestroy(matmulDesc);
 }
 
-// FP8 backward: grad_w[K,N] = x_f8[M,K].T @ grad_f8[M,N]
-// x_f8 row-major [M,K], grad_f8 row-major [M,N], grad_w row-major [K,N]
-static void gemm_fp8_backward_grad_w(cublasLtHandle_t handle,
-                                      const fp8e4m3* x_f8, const fp8e5m2* grad_f8,
-                                      float* grad_w,
-                                      int M, int N, int K,
-                                      float x_scale, float grad_scale,
-                                      float beta,
-                                      cudaStream_t stream) {
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-
-    // Row-major trick: grad_w_cm[N,K] = grad_cm[N,M] @ x_cm.T[M,K]
-    // grad_f8 rm [M,N] → cm [N,M,ld=N], no transpose
-    // x_f8 rm [M,K] → cm [K,M,ld=K], need transpose → op(B) = [M,K]
-    // grad_w rm [K,N] → cm [N,K,ld=N]
-    cublasOperation_t transA = CUBLAS_OP_N;
-    cublasOperation_t transB = CUBLAS_OP_T;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E5M2, N, M, N));   // grad cm: [N,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E4M3, K, M, K));   // x_f8 cm: [K,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, N, K, N));        // grad_w cm: [N,K]
-
-    float alpha = x_scale * grad_scale;
-
-    CUBLAS_CHECK(cublasLtMatmul(
-        handle, matmulDesc,
-        &alpha,
-        grad_f8, Adesc,
-        x_f8, Bdesc,
-        &beta,
-        grad_w, Cdesc,
-        grad_w, Cdesc,
-        NULL, NULL, 0, stream
-    ));
-
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-    cublasLtMatmulDescDestroy(matmulDesc);
+// FP8 forward: out[M,N] = x_f8[M,K] @ w_f8_T[N,K] (w_f8_T is physically transposed weight)
+// TN layout: D_cm[N,M] = A^T[N,K] * B[K,M]  where A=w_f8_T_cm[K,N], B=x_cm[K,M]
+static void gemm_fp8_forward(cublasLtHandle_t handle,
+                             const fp8e4m3* x_f8, const fp8e4m3* w_f8_T,
+                             bf16* out, int M, int N, int K,
+                             float x_scale, float w_scale,
+                             cudaStream_t stream) {
+    // w_f8_T rm[N,K] = cm[K,N,ld=K]. A^T = [N,K]. ✓
+    // x_f8 rm[M,K] = cm[K,M,ld=K]. B = [K,M]. ✓
+    // out rm[M,N] = cm[N,M,ld=N].
+    gemm_fp8_tn(handle,
+        w_f8_T, CUDA_R_8F_E4M3, K, N, K,
+        x_f8,   CUDA_R_8F_E4M3, K, M, K,
+        out,    CUDA_R_16BF,    N, M, N,
+        x_scale * w_scale, 0.0f, true, stream);
 }
 
-// FP8 backward: grad_w[K,N] = x_f8[M,K].T @ grad_f8[M,N] -> BF16 output with accumulation
-static void gemm_fp8_backward_grad_w_bf16(cublasLtHandle_t handle,
-                                      const fp8e4m3* x_f8, const fp8e5m2* grad_f8,
-                                      bf16* grad_w,
-                                      int M, int N, int K,
-                                      float x_scale, float grad_scale,
-                                      float beta,
+// FP8 backward: grad_x[M,K] = grad_f8[M,N] @ w_f8[K,N]^T
+// TN layout: D_cm[K,M] = A^T[K,N] * B[N,M]  where A=w_cm[N,K], B=grad_cm[N,M]
+static void gemm_fp8_backward_grad_x(cublasLtHandle_t handle,
+                                      const fp8e5m2* grad_f8, const fp8e4m3* w_f8,
+                                      bf16* grad_x, int M, int N, int K,
+                                      float grad_scale, float w_scale,
                                       cudaStream_t stream) {
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-
-    cublasOperation_t transA = CUBLAS_OP_N;
-    cublasOperation_t transB = CUBLAS_OP_T;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E5M2, N, M, N));   // grad cm: [N,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E4M3, K, M, K));   // x_f8 cm: [K,M]
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, N, K, N));       // grad_w cm: [N,K] BF16
-
-    float alpha = x_scale * grad_scale;
-
-    CUBLAS_CHECK(cublasLtMatmul(
-        handle, matmulDesc,
-        &alpha,
-        grad_f8, Adesc,
-        x_f8, Bdesc,
-        &beta,
-        grad_w, Cdesc,
-        grad_w, Cdesc,
-        NULL, NULL, 0, stream
-    ));
-
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-    cublasLtMatmulDescDestroy(matmulDesc);
+    // w_f8 rm[K,N] = cm[N,K,ld=N]. A^T = [K,N]. ✓
+    // grad_f8 rm[M,N] = cm[N,M,ld=N]. B = [N,M]. ✓
+    // grad_x rm[M,K] = cm[K,M,ld=K].
+    gemm_fp8_tn(handle,
+        w_f8,    CUDA_R_8F_E4M3, N, K, N,
+        grad_f8, CUDA_R_8F_E5M2, N, M, N,
+        grad_x,  CUDA_R_16BF,    K, M, K,
+        grad_scale * w_scale, 0.0f, false, stream);
 }
 
 // ============================================================================
@@ -1177,7 +1095,7 @@ static void alloc_activations(Activations* act, int max_tokens) {
     size_t THD2 = (size_t)T * H * HD * sizeof(bf16);
     size_t TMLP2 = (size_t)T * MLP_HDIM * sizeof(bf16);
     size_t TV2 = (size_t)T * VOCAB_SIZE * sizeof(bf16);
-    size_t TV1 = (size_t)T * VOCAB_SIZE;  // FP8
+    size_t TV2_gl = (size_t)T * VOCAB_SIZE * sizeof(bf16);  // grad_logits
     size_t ALIGN = 256;  // alignment padding per buffer
 
     // Count all buffers and compute total (with generous alignment padding)
@@ -1191,12 +1109,9 @@ static void alloc_activations(Activations* act, int max_tokens) {
     total += 4 * (THD2 + ALIGN); n_buffers += 4; // q,k,v,attn_out
     // MLP: mlp_pre, mlp_post
     total += 2 * (TMLP2 + ALIGN); n_buffers += 2;
-    // FP8: x_f8, w_f8
-    total += (size_t)T * D + ALIGN; n_buffers++; // x_f8
-    total += (size_t)D * VOCAB_SIZE + ALIGN; n_buffers++; // w_f8
-    // Logits + grad_logits
+    // Logits + grad_logits (both BF16)
     total += TV2 + ALIGN; n_buffers++; // logits
-    total += TV2 + ALIGN; n_buffers++; // grad_logits (bf16, roundtripped through FP8)
+    total += TV2_gl + ALIGN; n_buffers++; // grad_logits (bf16)
     // Loss
     total += 2 * ((size_t)T * sizeof(float) + ALIGN); n_buffers += 2; // losses, lse
     // Per-layer saved (11 layers * 10 buffers)
@@ -1262,15 +1177,13 @@ static void alloc_activations(Activations* act, int max_tokens) {
     BUMP(bf16, mlp_post, TMLP2);
     BUMP(bf16, mlp_out, TD2);
 
-    // FP8 buffers
-    BUMP(fp8e4m3, x_f8, (size_t)T * D);
-    BUMP(fp8e4m3, w_f8, (size_t)D * VOCAB_SIZE);
+    // Logits + grad_logits (BF16)
     BUMP(bf16, logits, TV2);
 
     // Loss buffers
     BUMP(float, losses, (size_t)T * sizeof(float));
     BUMP(float, lse, (size_t)T * sizeof(float));
-    BUMP(bf16, grad_logits, TV2);
+    BUMP(bf16, grad_logits, TV2_gl);
 
     // Skip buffers
     BUMP(bf16, skip_save, TD2);
@@ -2065,8 +1978,7 @@ void forward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     rms_norm_fwd(act->x, act->x, T, D, ctx->stream);
 
     if (is_training) {
-        // TODO: Use FP8 matmul once cuBLAS FP8 support is verified on this platform
-        // For now, use BF16 lm_head matmul (same as eval mode)
+        // BF16 lm_head matmul: logits = x @ lm_head (lm_head is [D, VOCAB_SIZE])
         gemm_bf16(ctx->cublas_handle, act->x, p->lm_head, act->logits, T, VOCAB_SIZE, D);
 
         // Copy MTP weights to scratch (reuse scratch_f32 to avoid alloc in hot path)
@@ -2137,7 +2049,7 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
 
     BWD_TIMER_START();
 
-    // 1. Softcapped CE backward -> BF16 gradients (scaled by 1/grad_s)
+    // 1. Softcapped CE backward -> BF16 gradients
     fill_constant_f32(act->scratch_f32, 1.0f / GRAD_ACCUM_STEPS, T, ctx->stream);
     CUDA_CHECK(cudaMemcpyAsync(act->scratch_f32 + T, mtp_weights, n_mtp * sizeof(float),
                                 cudaMemcpyHostToDevice, ctx->stream));
@@ -2145,38 +2057,22 @@ void backward_pass(TrainingContext* ctx, int32_t* inputs, int64_t* targets,
     softcapped_ce_bwd_bf16(act->grad_logits, act->scratch_f32, act->lse,
                            act->logits, targets, act->scratch_f32 + T,
                            T, VOCAB_SIZE, n_mtp,
-                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, FP8_GRAD_SCALE,
+                           SOFTCAP_A, SOFTCAP_B, SOFTCAP_C, 1.0f,
                            ctx->stream);
-
-    // Roundtrip grad_logits through FP8-E5M2 to match Python's quantization noise
-    // Input: true_grad/grad_s (bf16). Output: float(fp8_e5m2(true_grad/grad_s)) * grad_s ≈ true_grad
-    bf16_roundtrip_fp8_e5m2(act->grad_logits, 1.0f, FP8_GRAD_SCALE, (size_t)T * VOCAB_SIZE, ctx->stream);
 
     BWD_TIMER_END(g_bwd_ce_ms);
     BWD_TIMER_START();
 
-    // 2. lm_head backward via BF16 matmul with FP8-roundtripped operands
-    // Roundtrip lm_head weights through FP8-E4M3 (copy to logits buffer first)
-    bf16* w_rt = act->logits;  // logits buffer is T*V bf16, >> D*V needed
-    CUDA_CHECK(cudaMemcpyAsync(w_rt, p->lm_head, (size_t)MODEL_DIM * VOCAB_SIZE * sizeof(bf16),
-                                cudaMemcpyDeviceToDevice, ctx->stream));
-    bf16_roundtrip_fp8_e4m3(w_rt, 1.0f / FP8_W_SCALE, FP8_W_SCALE, MODEL_DIM * VOCAB_SIZE, ctx->stream);
-
-    // grad_x = grad_logits @ w_rt.T  (both already have FP8 noise baked in)
-    gemm_bf16_Bt(ctx->cublas_handle, act->grad_logits, w_rt, act->grad_x,
+    // 2. lm_head backward (BF16)
+    // grad_x = grad_logits @ lm_head^T  (lm_head is [D, V], so lm_head^T is [V, D])
+    gemm_bf16_Bt(ctx->cublas_handle, act->grad_logits, p->lm_head, act->grad_x,
                  T, MODEL_DIM, VOCAB_SIZE);
 
-    // Roundtrip act->x through FP8-E4M3 (copy to logits buffer after w_rt)
-    bf16* x_rt = w_rt + (size_t)MODEL_DIM * VOCAB_SIZE;
-    CUDA_CHECK(cudaMemcpyAsync(x_rt, act->x, (size_t)T * MODEL_DIM * sizeof(bf16),
-                                cudaMemcpyDeviceToDevice, ctx->stream));
-    bf16_roundtrip_fp8_e4m3(x_rt, 1.0f / FP8_X_SCALE, FP8_X_SCALE, T * MODEL_DIM, ctx->stream);
-
-    // grad_w += x_rt.T @ grad_logits  (accumulate to g->lm_head)
-    gemm_bf16_At(ctx->cublas_handle, x_rt, act->grad_logits, g->lm_head,
+    // grad_w += x.T @ grad_logits  (BF16 matmul, accumulate to g->lm_head)
+    gemm_bf16_At(ctx->cublas_handle, act->x, act->grad_logits, g->lm_head,
                  MODEL_DIM, VOCAB_SIZE, T, 1.0f, 1.0f);
 
-    // DIAG: grad_x norm after FP8 lm_head backward (before norm bwd)
+    // DIAG: grad_x norm after lm_head backward (before norm bwd)
     if (ctx->current_step == 0) {
         float gx_norm = bf16_l2_norm(act->grad_x, T * D, act->scratch_f32 + T + 256, ctx->stream);
         fprintf(stderr, "DIAG grad_x_pre_norm=%.4f\n", gx_norm);
@@ -3183,8 +3079,6 @@ void init_training_context(TrainingContext* ctx) {
     CURAND_CHECK(curandCreateGenerator(&ctx->curand_gen, CURAND_RNG_PSEUDO_DEFAULT));
     CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(ctx->curand_gen, 42));
 
-    // Arena allocator available but not currently used
-    // Individual buffers use cudaMalloc directly
 }
 
 void free_training_context(TrainingContext* ctx) {

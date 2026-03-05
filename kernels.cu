@@ -1771,6 +1771,60 @@ void bf16_to_fp8_e4m3(fp8e4m3* out, const bf16* x, float scale, int n, cudaStrea
     bf16_to_fp8_e4m3_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, x, scale, n);
 }
 
+// Dequantize FP8-E5M2 to BF16 with scaling
+__global__ void fp8_e5m2_to_bf16_kernel(bf16* __restrict__ out,
+                                         const fp8e5m2* __restrict__ x,
+                                         float scale, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = f_to_bf16(float(x[idx]) * scale);
+}
+
+void fp8_e5m2_to_bf16(bf16* out, const fp8e5m2* x, float scale, int n, cudaStream_t stream) {
+    int threads = 256;
+    fp8_e5m2_to_bf16_kernel<<<cdiv(n, threads), threads, 0, stream>>>(out, x, scale, n);
+}
+
+// Fused BF16→FP8-E4M3 quantize + transpose
+// src[M, N] row-major → out[N, M] row-major, with FP8 quantization
+__global__ void bf16_to_fp8_e4m3_transpose_kernel(fp8e4m3* __restrict__ out,
+                                                   const bf16* __restrict__ src,
+                                                   float scale, int M, int N) {
+    // Use shared memory tiling for coalesced access (32x32 tiles)
+    __shared__ fp8e4m3 tile[32][33];  // +1 to avoid bank conflicts
+    int bx = blockIdx.x * 32;
+    int by = blockIdx.y * 32;
+    int tx = threadIdx.x % 32;
+    int ty = threadIdx.x / 32;
+
+    // Load src[by+ty*4+k, bx+tx] for k=0..3 into tile (coalesced read of src rows)
+    for (int k = 0; k < 32; k += blockDim.x / 32) {
+        int row = by + ty + k;
+        int col = bx + tx;
+        if (row < M && col < N) {
+            float val = bf16_to_f(src[row * N + col]) / scale;
+            val = fminf(fmaxf(val, -448.0f), 448.0f);
+            tile[ty + k][tx] = __nv_fp8_e4m3(val);
+        }
+    }
+    __syncthreads();
+
+    // Write transposed: out[bx+ty*4+k, by+tx] = tile[tx][ty*4+k]
+    for (int k = 0; k < 32; k += blockDim.x / 32) {
+        int row = bx + ty + k;
+        int col = by + tx;
+        if (row < N && col < M) {
+            out[row * M + col] = tile[tx][ty + k];
+        }
+    }
+}
+
+void bf16_to_fp8_e4m3_transpose(fp8e4m3* out, const bf16* src, float scale, int M, int N, cudaStream_t stream) {
+    dim3 grid(cdiv(N, 32), cdiv(M, 32));
+    int threads = 32 * (32 / 4);  // 256 threads, each handles 4 rows
+    bf16_to_fp8_e4m3_transpose_kernel<<<grid, threads, 0, stream>>>(out, src, scale, M, N);
+}
+
 __global__ void bf16_to_fp8_e5m2_kernel(fp8e5m2* __restrict__ out,
                                          const bf16* __restrict__ x,
                                          float scale, int n) {

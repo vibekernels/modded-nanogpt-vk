@@ -266,15 +266,13 @@ typedef struct {
     bf16* mlp_post;             // post-activation [T, MLP_HDIM] (relu²)
     bf16* mlp_out;              // after W2 [T, MODEL_DIM]
 
-    // FP8 intermediates for lm_head
-    fp8e4m3* x_f8;             // [T, MODEL_DIM]
-    fp8e4m3* w_f8;             // [MODEL_DIM, VOCAB_SIZE]
+    // lm_head outputs
     bf16* logits;               // [T, VOCAB_SIZE]
 
     // Loss computation
     float* losses;              // [T]
     float* lse;                 // [T] log-sum-exp
-    bf16* grad_logits;           // [T, VOCAB_SIZE] backward gradient (BF16, roundtripped through FP8)
+    bf16* grad_logits;          // [T, VOCAB_SIZE] backward gradient (BF16)
 
     // Skip connection storage
     bf16* skip_save;            // [1, T, MODEL_DIM]
